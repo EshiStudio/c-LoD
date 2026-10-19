@@ -1,0 +1,37 @@
+{
+    "targets": {
+        "clod_atmo_swap": {}
+    },
+    "passes": [
+        {
+            "vertex_shader": "minecraft:core/screenquad",
+            "fragment_shader": "clod:post/atmosphere",
+            "inputs": [
+                { "sampler_name": "In", "target": "minecraft:main", "bilinear": true },
+                { "sampler_name": "InDepth", "target": "minecraft:main", "use_depth_buffer": true }
+            ],
+            "output": "clod_atmo_swap",
+            "uniforms": {
+                "ClodAtmo": [
+                    { "name": "AtmoParams", "type": "vec4", "value": [__ATMO_START__, __ATMO_END__, __ATMO_STRENGTH__, 0.0] }
+                ],
+                "ClodAtmoColor": [
+                    { "name": "VeilColor", "type": "vec4", "value": __VEIL_RGBA__ }
+                ]
+            }
+        },
+        {
+            "vertex_shader": "minecraft:core/screenquad",
+            "fragment_shader": "clod:post/clod_blit",
+            "inputs": [
+                { "sampler_name": "In", "target": "clod_atmo_swap" }
+            ],
+            "output": "minecraft:main",
+            "uniforms": {
+                "BlitConfig": [
+                    { "name": "ColorModulate", "type": "vec4", "value": [1.0, 1.0, 1.0, 1.0] }
+                ]
+            }
+        }
+    ]
+}

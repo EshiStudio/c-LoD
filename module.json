@@ -1,1 +1,5 @@
-{"id":"lod","version":"1.0.0","main":"liblod.so"}
+{
+  "id": "lod",
+  "version": "2.0.0",
+  "description": "True server-side LOD: /posteffect chains + server resource pack (GLSL raymarched distant terrain from a heightmap atlas). No Display entities."
+}

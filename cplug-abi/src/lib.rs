@@ -54,22 +54,15 @@ pub type ClassHookFn = unsafe extern "C" fn(
 
 /// Callback fired on an event-bus publish. `event` and `payload_json` are
 /// valid only for the duration of the call.
-pub type EventCb = unsafe extern "C" fn(
-    event: *const c_char,
-    payload_json: *const c_char,
-    ctx: *mut c_void,
-);
+pub type EventCb =
+    unsafe extern "C" fn(event: *const c_char, payload_json: *const c_char, ctx: *mut c_void);
 
 /// Callback for scheduler-injected work; runs on the kernel main thread.
 pub type SchedulerTaskCb = unsafe extern "C" fn(ctx: *mut c_void);
 
 /// Callback for faults (crash isolation brick).
-pub type FaultCb = unsafe extern "C" fn(
-    signal: i32,
-    timestamp_unix: u64,
-    count: u64,
-    ctx: *mut c_void,
-);
+pub type FaultCb =
+    unsafe extern "C" fn(signal: i32, timestamp_unix: u64, count: u64, ctx: *mut c_void);
 
 /// Verdict for the network packet pipeline.
 /// 0 = Pass, 1 = Drop, 2 = Disconnect.
@@ -88,10 +81,7 @@ pub struct CPacket {
 }
 
 /// Async callback handed to the hook; payload valid only during the call.
-pub type PacketHookCb = unsafe extern "C" fn(
-    pkt: *const CPacket,
-    ctx: *mut c_void,
-) -> i32;
+pub type PacketHookCb = unsafe extern "C" fn(pkt: *const CPacket, ctx: *mut c_void) -> i32;
 
 /// Save-lifecycle callback (`save_events` brick).
 /// kind: 0 = autosave, 1 = manual; status: 0 = ok, 1 = failed.
@@ -106,8 +96,7 @@ pub type SaveCb = unsafe extern "C" fn(
 /// Storage provider callbacks (all optional; a NULL pointer means "not
 /// supported" for that operation). Buffer lifetimes: the runtime owns the
 /// payload pointer during the call.
-pub type StorageNameCb =
-    unsafe extern "C" fn(ctx: *mut c_void) -> *const c_char;
+pub type StorageNameCb = unsafe extern "C" fn(ctx: *mut c_void) -> *const c_char;
 /// Returns 1=found, 0=not found, -1=corrupt.
 pub type StorageReadCb = unsafe extern "C" fn(
     ctx: *mut c_void,
@@ -141,12 +130,14 @@ pub struct CPlatformApi {
     pub events_subscribe:
         Option<unsafe extern "C" fn(event: *const c_char, cb: EventCb, ctx: *mut c_void) -> u64>,
     pub events_unsubscribe: Option<unsafe extern "C" fn(token: u64) -> i32>,
-    pub events_publish: Option<unsafe extern "C" fn(event: *const c_char, payload_json: *const c_char) -> usize>,
+    pub events_publish:
+        Option<unsafe extern "C" fn(event: *const c_char, payload_json: *const c_char) -> usize>,
 
     // --- scheduler (brick 3) ----------------------------------------------
     /// Queue `cb(ctx)` for the kernel main thread; returns a token (>0) or 0.
-    pub scheduler_inject:
-        Option<unsafe extern "C" fn(tag: *const c_char, cb: SchedulerTaskCb, ctx: *mut c_void) -> u64>,
+    pub scheduler_inject: Option<
+        unsafe extern "C" fn(tag: *const c_char, cb: SchedulerTaskCb, ctx: *mut c_void) -> u64,
+    >,
     pub scheduler_current_tick: Option<unsafe extern "C" fn() -> u64>,
     pub scheduler_injected_pending: Option<unsafe extern "C" fn() -> usize>,
 
@@ -169,37 +160,46 @@ pub struct CPlatformApi {
 
     // --- network (brick 6b) -----------------------------------------------
     pub network_add_hook: Option<unsafe extern "C" fn(cb: PacketHookCb, ctx: *mut c_void) -> i32>,
-    pub network_attach_conn: Option<unsafe extern "C" fn(conn_id: u64, player_uuid_hi: u64, player_uuid_lo: u64) -> i32>,
+    pub network_attach_conn:
+        Option<unsafe extern "C" fn(conn_id: u64, player_uuid_hi: u64, player_uuid_lo: u64) -> i32>,
     pub network_detach_conn: Option<unsafe extern "C" fn(conn_id: u64) -> i32>,
     pub network_conn_state: Option<unsafe extern "C" fn(conn_id: u64, state_code: u8) -> i32>,
     pub network_conn_count: Option<unsafe extern "C" fn() -> usize>,
 
     // --- storage (brick 5) -------------------------------------------------
     /// One-shot installer; callbacks on the passed vtable + ctx are captured.
-    pub storage_install: Option<unsafe extern "C" fn(
-        ctx: *mut c_void,
-        name: StorageNameCb,
-        read_chunk: StorageReadCb,
-        write_chunk: StorageWriteCb,
-        begin_save: StorageBeginSaveCb,
-        end_save: StorageEndSaveCb,
-    ) -> i32>,
+    pub storage_install: Option<
+        unsafe extern "C" fn(
+            ctx: *mut c_void,
+            name: StorageNameCb,
+            read_chunk: StorageReadCb,
+            write_chunk: StorageWriteCb,
+            begin_save: StorageBeginSaveCb,
+            end_save: StorageEndSaveCb,
+        ) -> i32,
+    >,
     pub storage_active: Option<unsafe extern "C" fn() -> i32>,
 
     // --- threads (brick 9) --------------------------------------------------
-    pub threads_spawn: Option<unsafe extern "C" fn(name: *const c_char, f: SchedulerTaskCb, ctx: *mut c_void) -> i32>,
-    pub threads_spawn_daemon: Option<unsafe extern "C" fn(name: *const c_char, f: SchedulerTaskCb, ctx: *mut c_void) -> i32>,
+    pub threads_spawn: Option<
+        unsafe extern "C" fn(name: *const c_char, f: SchedulerTaskCb, ctx: *mut c_void) -> i32,
+    >,
+    pub threads_spawn_daemon: Option<
+        unsafe extern "C" fn(name: *const c_char, f: SchedulerTaskCb, ctx: *mut c_void) -> i32,
+    >,
     pub threads_current_name: Option<unsafe extern "C" fn(out: *mut c_char, out_len: usize) -> i32>,
 
     // --- transform (brick 1) ------------------------------------------------
     /// injection: 0 = methodEntry, 1 = before_call(helper).
-    pub transform_register_rule: Option<unsafe extern "C" fn(
-        class_pattern: *const c_char,
-        method: *const c_char,
-        descriptor: *const c_char,
-        injection: i32,
-        helper: *const c_char,
-    ) -> i32>,
+    pub transform_register_rule: Option<
+        unsafe extern "C" fn(
+            class_pattern: *const c_char,
+            method: *const c_char,
+            descriptor: *const c_char,
+            injection: i32,
+            helper: *const c_char,
+        ) -> i32,
+    >,
 
     // --- save_events (brick 8) ----------------------------------------------
     pub save_events_on_save: Option<unsafe extern "C" fn(cb: SaveCb, ctx: *mut c_void) -> i32>,
@@ -213,7 +213,6 @@ pub struct CPlatformApi {
     /// NOTE: a barrier has no global state and is therefore not exposed;
     /// modules implementing barriers embed them in their own processes.
     /// (Reserved — keep alignment stable.)
-
     // --- side_table (brick 2) -------------------------------------------------
     pub side_table_key: Option<unsafe extern "C" fn(obj: *mut c_void, out: *mut u64) -> i32>,
     pub side_table_named: Option<unsafe extern "C" fn(name: *const c_char, out: *mut u64) -> i32>,

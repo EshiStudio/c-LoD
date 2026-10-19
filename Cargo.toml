@@ -1,8 +1,8 @@
 [package]
 name = "lod"
-version = "1.0.0"
+version = "2.0.0"
 edition = "2021"
-description = "c-LoD — Level-of-Distant-Detail terrain for Paper 26.3+ servers. A CRUSSTY module written in Rust: quadtree LOD planning, vanilla-client BlockDisplay impostors, chunk pinning via NMS TicketStorage. No client mods required."
+description = "c-LoD — true server-side LOD for Paper 26.3 via /posteffect + server resource pack. GLSL raymarched distant terrain from a heightmap atlas. No Display entities, no client mods."
 license = "MIT"
 
 [workspace]
@@ -21,6 +21,3 @@ jvmti-bindings = "2"
 lto = "fat"
 codegen-units = 1
 strip = "none"
-
-[profile.dev]
-opt-level = 1

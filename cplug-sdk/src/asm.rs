@@ -57,7 +57,12 @@ fn u16at(b: &[u8], p: usize) -> u16 {
 /// original names. All CP references are by index (not offset), so the
 /// attribute/method section is copied verbatim and stays consistent — the
 /// rewrite never moves code bytes.
-type Renamed = (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>);
+type Renamed = (
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+);
 
 fn rename_helper_classes(name: &str) -> Renamed {
     let map = HashMap::from([
@@ -261,10 +266,7 @@ fn warmup(env: &JniEnv, gref: jni::jclass) {
             let _res = env.call_static_object_method(
                 gref,
                 mid,
-                &[
-                    jni::jvalue { l: src_arr },
-                    jni::jvalue { l: spec_arr },
-                ],
+                &[jni::jvalue { l: src_arr }, jni::jvalue { l: spec_arr }],
             );
             env.delete_local_ref(spec_arr);
             env.delete_local_ref(src_arr);
@@ -351,10 +353,11 @@ pub fn replace_body(
     let spec_arr = env.new_byte_array(spec_bytes.len() as i32)?;
     let spec_signed: Vec<i8> = spec_bytes.iter().map(|&b| b as i8).collect();
     env.set_byte_array_region(spec_arr, 0, spec_bytes.len() as i32, &spec_signed);
-    let res = env.call_static_object_method(cls, mid, &[
-        jni::jvalue { l: src_arr },
-        jni::jvalue { l: spec_arr },
-    ]);
+    let res = env.call_static_object_method(
+        cls,
+        mid,
+        &[jni::jvalue { l: src_arr }, jni::jvalue { l: spec_arr }],
+    );
     let had_exc = clear_exception(env);
     env.delete_local_ref(spec_arr);
     env.delete_local_ref(src_arr);
@@ -362,7 +365,8 @@ pub fn replace_body(
         if !had_exc {
             // helper returned null: fetch lastError() for the log
             let _ = with_attached(|env| {
-                if let Some(e) = env.get_static_method_id(cls, "lastError", "()Ljava/lang/String;") {
+                if let Some(e) = env.get_static_method_id(cls, "lastError", "()Ljava/lang/String;")
+                {
                     let err = env.call_static_object_method(cls, e, &[]);
                     if !err.is_null() {
                         if let Some(msg) = env.get_string_utf(err as jni::jstring) {
@@ -396,10 +400,11 @@ mod tests {
     fn rename_preserves_structure_and_changes_this_class() {
         let name = format!("{ORIG_BASE}abc123");
         let (renamed, renamed1, renamed11, renamed2) = rename_helper_classes(&name);
-        let (renamed, renamed1, renamed11, renamed2) = match (renamed, renamed1, renamed11, renamed2) {
-            (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
-            _ => panic!("rename failed"),
-        };
+        let (renamed, renamed1, renamed11, renamed2) =
+            match (renamed, renamed1, renamed11, renamed2) {
+                (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
+                _ => panic!("rename failed"),
+            };
         assert!(
             !renamed.is_empty()
                 && !renamed1.is_empty()
@@ -438,10 +443,11 @@ mod tests {
         // time and would otherwise fail with NoClassDefFoundError.
         let name = format!("{ORIG_BASE}abc123");
         let (renamed, renamed1, renamed11, renamed2) = rename_helper_classes(&name);
-        let (renamed, renamed1, renamed11, renamed2) = match (renamed, renamed1, renamed11, renamed2) {
-            (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
-            _ => panic!("rename failed"),
-        };
+        let (renamed, renamed1, renamed11, renamed2) =
+            match (renamed, renamed1, renamed11, renamed2) {
+                (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
+                _ => panic!("rename failed"),
+            };
         // Every Utf8 in each renamed class: bare original names and
         // `L<orig>;` descriptor forms must be gone.
         for b in [&renamed, &renamed1, &renamed11, &renamed2] {

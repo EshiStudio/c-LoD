@@ -25,8 +25,8 @@ pub mod log;
 pub mod main_thread;
 pub mod weave;
 
-mod sdk_glob;
 pub mod jni_util;
+mod sdk_glob;
 
 pub use hooks::on_kernel_ready;
 pub use log::log_info;
@@ -104,7 +104,10 @@ pub unsafe fn init(api: *const CPluginApi, vm: JavaVmPtr) {
             api_ref.retransform_class.map(|f| f as usize).unwrap_or(0),
             Ordering::Relaxed,
         );
-        CLAIM.store(api_ref.claim.map(|f| f as usize).unwrap_or(0), Ordering::Relaxed);
+        CLAIM.store(
+            api_ref.claim.map(|f| f as usize).unwrap_or(0),
+            Ordering::Relaxed,
+        );
         CLAIM_OWNER.store(api as usize, Ordering::Relaxed);
         // register the SDK dispatch hook once (idempotent per process)
         if let Some(register) = api_ref.register_class_hook {

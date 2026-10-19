@@ -1,113 +1,106 @@
 # c-LoD
 
-**Level-of-Distant-Detail terrain for Paper 26.3+ servers.** A
-[CRUSSTY](https://github.com/PLANETA9091/CRUSSTY) module written in pure Rust
-that renders the far world as block-impostor terrain — **no client mods
-required**, works on the vanilla Minecraft client.
+**True server-side level-of-distant-detail terrain for Minecraft Java 26.3 ("Wilderness Bound") on Paper — as a [CRUSSTY](https://github.com/PLANETA9091/CRUSSTY) module written in Rust.**
 
-The server plans a quadtree of LOD cells around every player (starting right
-outside the vanilla view distance), keeps each cell's chunk loaded via NMS
-chunk tickets, snapshots its top terrain, and renders it as an interpolated
-`BlockDisplay` impostor. Far mountains, oceans and forests become visible
-horizon geometry instead of void.
+No client mods. **No Display entities.** The vanilla client renders the distant world itself, driven entirely by the `/posteffect` command + a server resource pack.
 
 ```
-        vanilla view distance          c-LoD impostors (up to max_distance)
-   ┌───────────────────────────┬──────────────────────────────────────────┐
-   │   real chunks (server)    │   2x2 .. 64x64-chunk impostor boxes      │
-   │        8 chunks           │   quadtree annuli, hysteresis            │
-   └───────────────────────────┴──────────────────────────────────────────┘
+ ┌─────────────────────────── SERVER (c-LoD module, Rust) ───────────────────────────┐
+ │                                                                                   │
+ │  heightmap scan (JNI, budgeted per tick) ──► atlas (height/water grid)            │
+ │        │                                        │                                 │
+ │        ▼                                        ▼                                 │
+ │  PlayerPostEffects.add(Key)      resource pack: post_effect chains + GLSL         │
+ │  Player.setResourcePack(...) ◄── + atlas PNG, served by embedded HTTP server       │
+ └────────────┬─────────────────────────────────────────────────────┬────────────────┘
+              │  ClientboundPostEffectsPacket                        │  pack download
+              ▼                                                      ▼
+ ┌──────────────────────────── VANILLA CLIENT 26.3 ──────────────────────────────────┐
+ │  clod:lod_terrain  (6 passes, every frame)                                        │
+ │   1. sun_scan    — sky pixels (depth == far): warm-blob weight field              │
+ │   2. sun_reduce  — 256x256 → 16x16 tile sums                                      │
+ │   3. sun_solve   — fit view rotation to the tracked sun/moon (GameTime is the     │
+ │                    free data channel; closed-form + Gauss-Newton, persistent      │
+ │                    1x1 rotation target with confidence)                           │
+ │   4. rot_copy    — ping-pong the rotation target                                  │
+ │   5. lod_terrain — raymarch the heightfield atlas over sky pixels: distant        │
+ │                    mountains, water, snow, distance fog into the veil color       │
+ │   6. blit        — composite back into minecraft:main                             │
+ │  clod:atmosphere  — depth veil over real terrain: hides the render-distance edge  │
+ └───────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+## Why this works on a vanilla client
+
+Every piece below was verified against the **unobfuscated 26.3 client jar** (Mojang maps are shipped raw since 26.3):
+
+| Fact | Source |
+|------|--------|
+| `ClientboundPostEffectsPacket(List<Identifier>)` → `LocalPlayer.setActivePostEffects` → `GameRenderer` diffs and runs `PostChain.process(...)` every frame | `ClientCommonPacketListenerImpl`, `GameRenderer`, `net/minecraft/client/renderer/PostChain` |
+| Chains load from the server resource pack: `assets/<ns>/post_effect/*.json` + `assets/<ns>/shaders/post/*.fsh` | `PostChainConfig`, vanilla `invert.json` / `entity_outline.json` |
+| Post passes can sample the **depth buffer** of `minecraft:main` (`"use_depth_buffer": true`) | `PostChainConfig$TargetInput`, `PostPass$TargetInput.getDepthTextureView` |
+| Post shaders get the **camera world position** via the `Globals` UBO (`CameraBlockPos` + `CameraOffset`), plus `GameTime` | `include/globals.glsl`, consumer `post/box_blur.fsh` (proves Globals is bound in post passes) |
+| Pack textures are addressable as samplers (`texture: "clod:effect/atlas"` → `clod:textures/effect/atlas.png`) | `PostChainConfig$TextureInput` (`sampler_name/location/width/height/bilinear`), `PostChain` `withPath` |
+| Uniform types `float/int/ivec3/vec2/vec3/vec4/matrix4x4` become `std140` UBOs from JSON | `UniformValue$Type` |
+| Paper API: `Player#postEffects()` → `PlayerPostEffects.add/remove(Key)`, `Player.setResourcePack(UUID,url,sha1,prompt,force)` | Paper 26.3 javadoc |
+
+The sky region is `depth == 1.0` (sky/clouds never write depth), which is exactly where the LOD raymarch paints. `GameTime` (day fraction, `fract()`-safe) gives the sun/moon direction, and the sun disc visible in the color buffer gives the **view rotation** back — no data channel to the client is needed at all.
 
 ## Install
 
-Requires a CRUSSTY-injected server (`crussty init && crussty run`).
-
 ```bash
-# from a GitHub release bundle
 crussty install PLANETA9091/c-LoD
-
-# or drop the module folder next to your other modules
-modules/
-└── lod/
-    ├── module.json
-    └── liblod.so
+# or drop the release bundle into modules/
 ```
 
-Then just boot the server. On first boot the module raises
-`entity-tracking-range.display` in `spigot.yml` (pre-kernel, so no restart is
-needed) — far displays would be invisible without it.
+Requires: Paper (or Purpur) 26.3+, Java 25+ runtime, CRUSSTY runtime. The module opens one HTTP port for the resource pack.
 
-## Configuration — `modules/lod/clod.conf`
+## Configuration
 
-Every key is optional; defaults below.
+Options string passed through the CRUSSTY runtime (`key=value;key=value`):
 
-```ini
-max_distance        = 1024   # LOD radius in blocks (128..32768)
-view_distance       = 0      # 0 = read live from server.properties
-growth              = 2.0    # annulus growth per level (1.3..4.0)
-hysteresis          = 0.05   # boundary stickiness (0..0.3)
-update_interval_ms  = 500    # planning poll interval
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `http_port` | `8199` | Port of the embedded pack server |
+| `pack_base_url` | *(auto)* | Public base URL, e.g. `http://play.example.com` |
+| `pack_uuid` | fixed | Stable pack UUID (clients re-download only on SHA-1 change) |
+| `pack_prompt` | *(empty)* | Client prompt text |
+| `world` | first world | World scanned for the atlas |
+| `center_x` / `center_z` | `0` | Atlas center in blocks |
+| `atlas_size` | `4096` | Side length in blocks (power of two, 512–16384) |
+| `cell_size` | `4` | Blocks per atlas texel (power of two) |
+| `scan_budget` | `4096` | Heightmap cells scanned per engine tick |
+| `refresh_secs` | `300` | Minimum seconds between pack rebuilds |
+| `fov` | `70` | Vertical FOV the GLSL ray reconstruction assumes (client FOV) |
+| `lod_near` | `256` | LOD raymarch starts here (keep above view distance) |
+| `sea_level` | `63` | Water level |
+| `color_low/color_high/color_water/color_veil` | defaults | Palette, `r/g/b` floats or 0–255 |
+| `snow_line` | `0.78` | Snow blend point (normalized elevation) |
+| `sun_threshold` / `rot_blend` | `0.18` / `0.35` | Sun-tracker gates |
+| `max_height` | `320` | Terrain ceiling used for ray culling |
 
-snapshots_per_cycle = 128    # chunk snapshot reads / cycle
-spawns_per_cycle    = 64     # display spawns / cycle
-updates_per_cycle   = 64     # display updates / cycle
-despawns_per_cycle  = 128
-pins_per_cycle      = 32     # chunk tickets / cycle
-unpins_per_cycle    = 64
-max_cells_total     = 4096   # global impostor cap
-max_cells_per_player = 512
+Post-effect ids installed by the pack: **`clod:lod_terrain`**, **`clod:atmosphere`** — exactly the identifiers the vanilla `/posteffect` command accepts, so admins can also toggle them by hand:
 
-interpolation_ticks = 8      # display interpolation (0..59)
-teleport_ticks      = 8
-brightness          = 15     # block+sky light override
-refresh_secs        = 60     # re-snapshot active LOD0 cells (world edits)
-
-tickets             = auto   # auto | nms | forceload | none
-tracking_raise      = true   # pre-boot spigot.yml entity-tracking-range fix
-log_interval_cycles = 40
+```
+/posteffect add @a clod:lod_terrain
 ```
 
-## Chunk pinning backends
-
-| backend     | how                                                  | ticking | persistent |
-|-------------|------------------------------------------------------|---------|------------|
-| `nms`       | `TicketStorage.addTicketWithRadius(PLAYER_LOADING, pos, 0)` at FULL level (runtime-probed against the 26.3 API) | no  | no  |
-| `forceload` | `World#setChunkForceLoaded` (Bukkit)                 | yes | yes |
-| `none`      | never pin — impostors only inside loaded chunks      | —   | —   |
-
-`auto` probes the NMS chain and falls back to `forceload`.
-
-## How it works
-
-1. **Pre-boot** (`cplugin_init`, before the kernel): load `clod.conf`, patch
-   `spigot.yml`.
-2. **Kernel-ready**: resolve the whole Bukkit + JOML + NMS surface once on the
-   main thread (lazy classes forced through the kernel class loader,
-   fully initialized before `GetMethodID`), probe the ticket backend, report
-   `bootstrap ok`.
-3. **Worker thread** (pure Rust): per player — quadtree annulus selection
-   (cells of 2x2..64x64 chunks, distance bands `[T_L, T_{L+1})` with
-   hysteresis), snapshot aggregation from the chunk cache, delta planning
-   (spawn/update/despawn/pin/unpin) under per-cycle budgets.
-4. **Main thread**: execute op batches — spawn `BlockDisplay` impostors
-   (scale = cell size, height = terrain, map-color representative block,
-   brightness 15, interpolation), pin/unpin chunks via `TicketStorage`.
-
-All NMS signatures are verified at runtime with precise diagnostics — no
-silent guessing. Every JVM failure degrades gracefully (missing entities
-respawn, failed pins retry).
-
-## Build
+## Development
 
 ```bash
-cargo build --release        # -> target/release/liblod.so
-cargo test                   # 39 unit + integration tests
-cargo clippy --all-targets -- -D warnings
+bash build.sh                 # cargo build --release -> liblod.so
+cargo test                    # 23 unit tests (zip/png/sha1/atlas/packgen/config)
+bash scripts/check_glsl.sh    # glslangValidator over all shaders + chain JSONs
 ```
 
-CI runs fmt + clippy + tests + a real **Paper 26.3 boot e2e** on GitHub
-Actions (see `.github/workflows/ci.yml`).
+CI runs rustfmt, clippy (`-D warnings`), the full test suite, glslang shader validation, release builds on Linux/macOS/Windows, and produces the CRUSSTY module bundle (`lod-v<ver>-linux-x64.tar.gz`).
+
+## Honest limitations (v1)
+
+- **FOV is a config value.** The shader reconstructs view rays from the configured FOV; if a player's FOV differs, distant LOD is slightly misaligned (imperceptible at typical distances, or fix it per-server).
+- **Rotation acquisition needs the sun or moon on screen.** Indoors/caves the tracker holds its last estimate (with decay) and the atmosphere chain keeps working — it never needs rotation.
+- The sun tracker may briefly blend into bright warm clouds at sunset; temporal blending and confidence gating keep the LOD stable.
+- Atlas generation forces chunk loads — keep `scan_budget` reasonable for your tick budget.
 
 ## License
 
