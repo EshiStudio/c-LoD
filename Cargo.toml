@@ -1,0 +1,26 @@
+[package]
+name = "lod"
+version = "1.0.0"
+edition = "2021"
+description = "c-LoD — Level-of-Distant-Detail terrain for Paper 26.3+ servers. A CRUSSTY module written in Rust: quadtree LOD planning, vanilla-client BlockDisplay impostors, chunk pinning via NMS TicketStorage. No client mods required."
+license = "MIT"
+
+[workspace]
+exclude = ["cplug-abi", "cplug-sdk"]
+
+[lib]
+name = "lod"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+cplug-abi = { path = "cplug-abi" }
+cplug-sdk = { path = "cplug-sdk" }
+jvmti-bindings = "2"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "none"
+
+[profile.dev]
+opt-level = 1
