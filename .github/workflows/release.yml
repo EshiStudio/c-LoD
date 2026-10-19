@@ -1,0 +1,96 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to release (e.g. v2.0.0)"
+        required: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  bundle:
+    name: bundle (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            lib: liblod.so
+            platform: linux-x64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            lib: liblod.dylib
+            platform: macos-x64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            lib: liblod.dylib
+            platform: macos-arm64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            lib: lod.dll
+            platform: windows-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Verify module.json version matches tag
+        shell: bash
+        run: |
+          VERSION=$(python3 -c "import json;print(json.load(open('module.json'))['version'])")
+          TAG="${GITHUB_REF_NAME#v}"
+          if [ -n "$TAG" ] && [ "$TAG" != "$VERSION" ]; then
+            echo "tag v$TAG != module.json version $VERSION" >&2
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+      - name: Pack CRUSSTY bundle
+        shell: bash
+        run: |
+          mkdir -p "dist/lod-v${VERSION}-${{ matrix.platform }}"
+          cp "target/${{ matrix.target }}/release/${{ matrix.lib }}" "dist/lod-v${VERSION}-${{ matrix.platform }}/"
+          cp module.json "dist/lod-v${VERSION}-${{ matrix.platform }}/"
+          tar czf "lod-v${VERSION}-${{ matrix.platform }}.tar.gz" -C dist "lod-v${VERSION}-${{ matrix.platform }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.platform }}
+          path: "*.tar.gz"
+          if-no-files-found: error
+
+  release:
+    name: GitHub release
+    needs: [bundle]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Compute checksums
+        run: |
+          cd dist
+          sha256sum *.tar.gz > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: c-LoD ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS.txt

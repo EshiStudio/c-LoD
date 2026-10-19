@@ -1,6 +1,6 @@
 #version 330
 #extension GL_ARB_separate_shader_objects : require
-#moj_import <minecraft:globals.glsl>
+#include <minecraft:globals.glsl>
 
 // c-LoD pass 1: sun candidate scan.
 // For every screen pixel that shows sky (device depth ~ 1.0), estimate how

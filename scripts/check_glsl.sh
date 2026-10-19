@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Validates the c-LoD post-effect shaders with glslangValidator.
 #
-# The shaders are written for Minecraft's shader preprocessor:
-#   - `#moj_import <minecraft:globals.glsl>` is resolved by the game, so we
+# The shaders are written for Minecraft 26.3 (shaderc-based compilation):
+#   - `#include <minecraft:globals.glsl>` is resolved by the game, so we
 #     replace it with a minimal stub of the Globals UBO (verified against
-#     the vanilla box_blur.fsh consumer).
+#     the vanilla box_blur.fsh consumer — shaderc accepts only #include,
+#     the legacy #moj_import directive no longer exists in 26.3).
 #   - Custom UBOs come from the chain JSON at runtime; the harness appends
 #     declaration stubs collected from assets/post_effect/*.json.
 #   - texCoord is the varying produced by vanilla core/screenquad.vsh.
@@ -50,7 +51,11 @@ for chain in Path("assets/post_effect").glob("*.json"):
 
 for fsh in sorted(Path("assets/glsl").glob("*.fsh")):
     src = fsh.read_text()
-    src = src.replace("#moj_import <minecraft:globals.glsl>", GLOBALS_STUB)
+    src = src.replace("#include <minecraft:globals.glsl>", GLOBALS_STUB)
+    # Legacy directive (pre-26.3): reject loudly if it sneaks back in.
+    if "#moj_import" in src:
+        print(f"FAIL {fsh.name}: #moj_import is not supported by the 26.3 shaderc pipeline")
+        sys.exit(1)
 
     # Harness-only: binding layout qualifier needs 420pack under GL semantics.
     src = src.replace(

@@ -1,6 +1,6 @@
 #version 330
 #extension GL_ARB_separate_shader_objects : require
-#moj_import <minecraft:globals.glsl>
+#include <minecraft:globals.glsl>
 
 // c-LoD pass 5: the actual level-of-distant-detail renderer.
 //

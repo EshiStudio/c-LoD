@@ -30,7 +30,7 @@ layout(std140) uniform ClodSolve {
     vec4 SolveParams;
 };
 
-#moj_import <minecraft:globals.glsl>
+#include <minecraft:globals.glsl>
 
 layout(location = 0) in vec2 texCoord;
 layout(location = 0) out vec4 fragColor;
