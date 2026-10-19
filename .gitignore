@@ -3,5 +3,5 @@ Cargo.lock
 *.so
 *.dll
 *.dylib
-dist/
+/dist/
 clod.conf
