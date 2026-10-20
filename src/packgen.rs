@@ -118,7 +118,13 @@ pub fn build(cfg: &Config, atlas: &Atlas) -> Pack {
     let clod_blit = include_str!("../assets/glsl/clod_blit.fsh");
     let atmosphere = include_str!("../assets/glsl/atmosphere.fsh");
 
-    let mcmeta = "{\"pack\":{\"pack_format\":97,\"description\":\"c-LoD v3 static LOD terrain (posteffect + heightfield raymarch)\"}}".to_string();
+    // 26.3 pack.mcmeta schema (verified against vanilla embedded packs and
+    // PackFormat$IntermediaryFormat): packs declaring a format newer than 64
+    // MUST carry min_format/max_format; the legacy pack_format key is what
+    // triggered the client warning "missing mandatory fields min_format and
+    // max_format" (ResourceMetadata fallback). 97 = resource_major of 26.3
+    // (client version.json: resource_major 97, resource_minor 1).
+    let mcmeta = "{\"pack\":{\"description\":\"c-LoD v3 static LOD terrain (posteffect + heightfield raymarch)\",\"min_format\":97,\"max_format\":97}}".to_string();
 
     let (aw, ah, atlas_rgba) = atlas.encode_rgba();
     let atlas_png = png::encode_png(aw, ah, &atlas_rgba);
@@ -205,6 +211,39 @@ mod tests {
         let s = String::from_utf8_lossy(pack.zip.as_slice());
         assert!(!s.contains("__FOV__"), "tokens must be substituted");
         let _ = zipw::crc32(pack.zip.as_slice());
+    }
+
+    #[test]
+    fn mcmeta_uses_26_3_new_format_schema() {
+        // Client 26.3 refuses legacy-only mcmeta for formats > 64 ("missing
+        // mandatory fields min_format and max_format"). The pack must follow
+        // the vanilla-26.3 schema: min_format/max_format, no legacy key.
+        let cfg = Config::parse("");
+        let atlas = Atlas::new(0, 0, 256, 4, 63);
+        let pack = build(&cfg, &atlas);
+        let start = pack
+            .zip
+            .windows(4)
+            .position(|w| w == [0x50, 0x4b, 0x03, 0x04])
+            .expect("local file header");
+        // First entry is pack.mcmeta (STORE) — find its data right after the header.
+        let name_len = u16::from_le_bytes([pack.zip[start + 26], pack.zip[start + 27]]) as usize;
+        let extra_len = u16::from_le_bytes([pack.zip[start + 28], pack.zip[start + 29]]) as usize;
+        let size = u32::from_le_bytes([
+            pack.zip[start + 18],
+            pack.zip[start + 19],
+            pack.zip[start + 20],
+            pack.zip[start + 21],
+        ]) as usize;
+        let mcmeta = String::from_utf8_lossy(
+            &pack.zip[start + 30 + name_len + extra_len..start + 30 + name_len + extra_len + size],
+        );
+        assert!(mcmeta.contains("\"min_format\":97"), "mcmeta: {mcmeta}");
+        assert!(mcmeta.contains("\"max_format\":97"), "mcmeta: {mcmeta}");
+        assert!(
+            !mcmeta.contains("pack_format"),
+            "legacy key must go: {mcmeta}"
+        );
     }
 
     #[test]
