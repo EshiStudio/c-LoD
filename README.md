@@ -92,11 +92,13 @@ Post-effect ids installed by the pack: **`clod:lod_terrain`**, **`clod:atmospher
 
 ```bash
 bash build.sh                 # cargo build --release -> liblod.so
-cargo test                    # 23 unit tests (zip/png/sha1/atlas/packgen/config)
+cargo test                    # 28 unit tests (zip/png/sha1/atlas/packgen/config/engine)
 bash scripts/check_glsl.sh    # glslangValidator over all shaders + chain JSONs
 ```
 
-CI runs rustfmt, clippy (`-D warnings`), the full test suite, glslang shader validation, release builds on Linux/macOS/Windows, and produces the CRUSSTY module bundle (`lod-v<ver>-linux-x64.tar.gz`).
+CI runs rustfmt, clippy (`-D warnings`), the full test suite, glslang shader validation, release builds on Linux/macOS/Windows, the CRUSSTY module bundle — and an **e2e live-server job**: a real Paper 26.3 kernel on Temurin 25 with the CRUSSTY runtime built from source, two boots asserting gates G1–G7 (single static finalize, zero runtime rebuilds, HTTP pack fetch, `atlas restored` + SHA-1 stability across restarts).
+
+## Honest limitations (v3)
 
 ## Honest limitations (v1)
 
