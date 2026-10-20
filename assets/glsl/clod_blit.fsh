@@ -3,7 +3,7 @@
 
 // c-LoD pass 6: composite the LOD frame back into minecraft:main.
 
-uniform sampler2D In;
+uniform sampler2D InSampler;
 
 layout(std140) uniform BlitConfig {
     vec4 ColorModulate;
@@ -13,5 +13,5 @@ layout(location = 0) in vec2 texCoord;
 layout(location = 0) out vec4 fragColor;
 
 void main() {
-    fragColor = texture(In, texCoord) * ColorModulate;
+    fragColor = texture(InSampler, texCoord) * ColorModulate;
 }

@@ -31,7 +31,7 @@ use crate::jni::{self, PlayerInfo};
 use crate::packgen::{self, Pack};
 use jvmti_bindings::prelude::JniEnv;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 pub const PHASE_BOOT: u8 = 0;
@@ -59,6 +59,10 @@ pub struct State {
     pub keys: Mutex<Option<Keys>>,
     pub per_player: Mutex<HashMap<String, PlayerState>>,
     pub pack_uuid: Mutex<usize>,
+    /// Engine tick counter (every tick() on the main thread).
+    pub tick_no: AtomicU64,
+    /// Rate limiter for pack-push failure logs.
+    pub push_fails: AtomicU32,
 }
 
 #[derive(Clone)]
@@ -75,6 +79,14 @@ pub struct PlayerState {
     pub pushed_sha: String,
     pub terrain_on: bool,
     pub atmosphere_on: bool,
+    /// Effect-list re-sends since the pack push. The client may finish the
+    /// pack download/reload AFTER the first effect packet (push/reload race:
+    /// the client logs "Requested post effect does not exist" and drops the
+    /// chains). A few idempotent `PlayerPostEffects.update()` heartbeats let
+    /// the client resolve the chains as soon as the pack is live.
+    pub resends: u32,
+    /// Last applied tier (0=Off, 1=Veil, 2=Full) for change logging.
+    pub last_tier: u8,
 }
 
 /// Per-player LOD tier, re-evaluated every tick. Switching tiers is pure
@@ -141,6 +153,8 @@ impl State {
             keys: Mutex::new(None),
             per_player: Mutex::new(HashMap::new()),
             pack_uuid: Mutex::new(0),
+            tick_no: AtomicU64::new(0),
+            push_fails: AtomicU32::new(0),
             cfg,
         })
     }
@@ -152,6 +166,7 @@ static BRIDGE_OK: AtomicU8 = AtomicU8::new(0); // 0 pending, 1 ok, 2 failed-once
 
 /// One engine tick. MUST run on the main thread.
 pub fn tick(state: &Arc<State>, env: Env) {
+    state.tick_no.fetch_add(1, Ordering::Relaxed);
     ensure_boot(state, env);
     scan_batch(state, env);
     release_forceload(state, env);
@@ -387,7 +402,27 @@ fn manage_players(state: &Arc<State>, env: Env) {
                         );
                         if ok {
                             st.pushed_sha = pack.sha1_hex.clone();
+                            st.resends = 0;
+                            crate::log_info(&format!(
+                                "pack pushed to {} ({}): {} bytes, sha1 {}",
+                                p.uuid,
+                                url,
+                                pack.zip.len(),
+                                pack.sha1_hex
+                            ));
+                        } else if state.push_fails.fetch_add(1, Ordering::Relaxed) < 10 {
+                            crate::log_info("pack push FAILED (see exception above)");
                         }
+                    }
+                }
+            } else if st.resends < 12 && state.tick_no.load(Ordering::Relaxed).is_multiple_of(20) {
+                // Self-healing: re-send the (unchanged) effect list a few
+                // times after the push so a client that was mid-reload when
+                // the first packet landed picks the chains up. Identical
+                // lists are a wire no-op — zero flicker, zero reloads.
+                if let Some(handle) = jni::player_by_uuid(env, &p.uuid) {
+                    if jni::update_effects(env, handle) {
+                        st.resends += 1;
                     }
                 }
             }
@@ -395,6 +430,35 @@ fn manage_players(state: &Arc<State>, env: Env) {
 
         // 2. Tier switching — the only dynamic surface, pure /posteffect.
         let tier = tier_for(state, &p);
+        let tier_no = match tier {
+            Tier::Full => 2u8,
+            Tier::Veil => 1,
+            Tier::Off => 0,
+        };
+        if st.last_tier != tier_no {
+            crate::log_info(&format!(
+                "tier {} -> {} for {} at ({}, {}) {}",
+                match st.last_tier {
+                    2 => "Full",
+                    1 => "Veil",
+                    _ => "Off",
+                },
+                match tier {
+                    Tier::Full => "Full",
+                    Tier::Veil => "Veil",
+                    Tier::Off => "Off",
+                },
+                p.uuid,
+                p.bx,
+                p.bz,
+                if p.world.is_empty() {
+                    "(no world)"
+                } else {
+                    &p.world
+                }
+            ));
+            st.last_tier = tier_no;
+        }
         let have_pack = pack.is_some();
         if let Some(handle) = jni::player_by_uuid(env, &p.uuid) {
             let want_terrain = have_pack && tier == Tier::Full && keys.terrain != 0;

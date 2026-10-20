@@ -10,8 +10,8 @@
 // rotation estimate — this is how c-LoD recovers the view direction without
 // any client mod: everything comes from the scene itself.
 
-uniform sampler2D In;      // minecraft:main (color)
-uniform sampler2D InDepth; // minecraft:main (depth buffer)
+uniform sampler2D InSampler;      // minecraft:main (color)
+uniform sampler2D InDepthSampler; // minecraft:main (depth buffer)
 
 layout(std140) uniform SamplerInfo {
     vec2 OutSize;
@@ -29,8 +29,8 @@ layout(location = 0) out vec4 fragColor;
 const float SKY_DEPTH = 0.99995;
 
 void main() {
-    float depth = texture(InDepth, texCoord).r;
-    vec3 col = texture(In, texCoord).rgb;
+    float depth = texture(InDepthSampler, texCoord).r;
+    vec3 col = texture(InSampler, texCoord).rgb;
 
     // Sky pixels only: real geometry (and the LOD we draw later) never
     // writes to the far plane.

@@ -4,7 +4,7 @@
 // c-LoD pass 2: reduce the 256x256 sun-candidate field to 16x16 tiles.
 // Each output texel = (sum w, sum w*u, sum w*v, 1) over its 16x16 tile.
 
-uniform sampler2D Scan; // clod:clod_scan (256x256)
+uniform sampler2D ScanSampler; // clod:clod_scan (256x256)
 
 layout(std140) uniform SamplerInfo {
     vec2 OutSize;
@@ -23,7 +23,7 @@ void main() {
     float sv = 0.0;
     for (int y = 0; y < 16; ++y) {
         for (int x = 0; x < 16; ++x) {
-            vec4 s = texelFetch(Scan, base + ivec2(x, y), 0);
+            vec4 s = texelFetch(ScanSampler, base + ivec2(x, y), 0);
             sw += s.r;
             su += s.r * s.g;
             sv += s.r * s.b;

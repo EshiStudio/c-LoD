@@ -5,7 +5,7 @@
 // (clod_rot_b -> clod_rot_a) so the next frame seeds from the newest solve
 // without ever reading and writing the same target in one pass.
 
-uniform sampler2D In;
+uniform sampler2D InSampler;
 
 layout(std140) uniform SamplerInfo {
     vec2 OutSize;
@@ -16,5 +16,5 @@ layout(location = 0) in vec2 texCoord;
 layout(location = 0) out vec4 fragColor;
 
 void main() {
-    fragColor = texelFetch(In, ivec2(0, 0), 0);
+    fragColor = texelFetch(InSampler, ivec2(0, 0), 0);
 }

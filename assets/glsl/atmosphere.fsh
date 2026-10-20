@@ -12,8 +12,8 @@
 // The veil color tracks the day cycle through GameTime (post chains receive
 // Globals but no Fog UBO — verified against the 26.3 client sources).
 
-uniform sampler2D In;      // minecraft:main color
-uniform sampler2D InDepth; // minecraft:main depth
+uniform sampler2D InSampler;      // minecraft:main color
+uniform sampler2D InDepthSampler; // minecraft:main depth
 
 layout(std140) uniform SamplerInfo {
     vec2 OutSize;
@@ -35,8 +35,8 @@ layout(location = 0) out vec4 fragColor;
 const float SKY_DEPTH = 0.99995;
 
 void main() {
-    vec4 scene = texture(In, texCoord);
-    float depth = texture(InDepth, texCoord).r;
+    vec4 scene = texture(InSampler, texCoord);
+    float depth = texture(InDepthSampler, texCoord).r;
 
     // Sky pixels stay vanilla: the LOD chain paints distant terrain there.
     if (depth < SKY_DEPTH || depth <= 0.0) {

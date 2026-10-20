@@ -17,8 +17,8 @@
 // If nothing was detected, the previous estimate decays instead of being
 // corrupted. LOD rendering keys off confidence.
 
-uniform sampler2D Small; // clod:clod_scan_small (16x16 tile sums)
-uniform sampler2D Prev;  // clod:clod_rot_a  (1x1 persistent)
+uniform sampler2D SmallSampler; // clod:clod_scan_small (16x16 tile sums)
+uniform sampler2D PrevSampler;  // clod:clod_rot_a  (1x1 persistent)
 
 layout(std140) uniform SamplerInfo {
     vec2 OutSize;
@@ -78,7 +78,7 @@ void main() {
     ivec2 bestTile = ivec2(0);
     for (int y = 0; y < 16; ++y) {
         for (int x = 0; x < 16; ++x) {
-            float w = texelFetch(Small, ivec2(x, y), 0).r;
+            float w = texelFetch(SmallSampler, ivec2(x, y), 0).r;
             if (w > best) {
                 best = w;
                 bestTile = ivec2(x, y);
@@ -95,14 +95,14 @@ void main() {
             if (any(lessThan(t, ivec2(0))) || any(greaterThanEqual(t, ivec2(16)))) {
                 continue;
             }
-            vec4 s = texelFetch(Small, t, 0);
+            vec4 s = texelFetch(SmallSampler, t, 0);
             sw += s.r;
             su += s.r * s.g;
             sv += s.r * s.b;
         }
     }
 
-    vec4 prev = texelFetch(Prev, ivec2(0), 0);
+    vec4 prev = texelFetch(PrevSampler, ivec2(0), 0);
     float prevAz = prev.r * 6.28318530718;
     float prevEl = prev.g * PI - PI * 0.5;
     float prevConf = prev.b;

@@ -57,7 +57,7 @@
             "inputs": [
                 { "sampler_name": "In", "target": "minecraft:main" },
                 { "sampler_name": "InDepth", "target": "minecraft:main", "use_depth_buffer": true },
-                { "sampler_name": "Atlas", "texture": "clod:effect/atlas", "width": __ATLAS_CELLS__, "height": __ATLAS_CELLS__, "bilinear": true },
+                { "sampler_name": "Atlas", "location": "clod:effect/atlas", "width": __ATLAS_CELLS__, "height": __ATLAS_CELLS__, "bilinear": true },
                 { "sampler_name": "Rot", "target": "clod_rot_a" }
             ],
             "output": "clod_swap",

@@ -44,8 +44,9 @@ fn vec4(v: [f32; 4]) -> String {
     )
 }
 
-fn vec3(v: [f32; 3]) -> String {
-    format!("[{}, {}, {}]", fmt_f(v[0]), fmt_f(v[1]), fmt_f(v[2]))
+fn rgba(v: [f32; 3]) -> String {
+    // colors are authored as RGB; the uniform is vec4 — append opaque alpha
+    format!("[{}, {}, {}, 1.0]", fmt_f(v[0]), fmt_f(v[1]), fmt_f(v[2]))
 }
 
 fn substitute(template: &str, map: &[(&str, String)]) -> String {
@@ -94,9 +95,12 @@ pub fn build(cfg: &Config, atlas: &Atlas) -> Pack {
         ("__MIN_CONF__", fmt_f(0.25)),
         ("__FOG_START__", fmt_f(fog_start)),
         ("__FOG_END__", fmt_f(fog_end)),
-        ("__COL_LOW__", vec3(cfg.color_low)),
-        ("__COL_HIGH__", vec3(cfg.color_high)),
-        ("__COL_WATER__", vec3(cfg.color_water)),
+        // 26.3 post-chain codec: a vec4 uniform value MUST be a 4-element
+        // list (client error: "Input is not a list of 4 elements") — pad the
+        // RGB palette colors with alpha 1.0.
+        ("__COL_LOW__", rgba(cfg.color_low)),
+        ("__COL_HIGH__", rgba(cfg.color_high)),
+        ("__COL_WATER__", rgba(cfg.color_water)),
         ("__VEIL_RGBA__", vec4(veil_rgba)),
         ("__ATMO_START__", atmo_start),
         ("__ATMO_END__", atmo_end),

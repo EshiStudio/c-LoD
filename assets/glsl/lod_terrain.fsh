@@ -13,10 +13,10 @@
 //
 // Non-sky pixels pass through untouched: real chunks always win.
 
-uniform sampler2D In;      // minecraft:main color
-uniform sampler2D InDepth; // minecraft:main depth
-uniform sampler2D Atlas;   // clod:textures/effect/atlas.png (RG = height, B = water)
-uniform sampler2D Rot;     // clod:clod_rot_a (1x1 persistent)
+uniform sampler2D InSampler;      // minecraft:main color
+uniform sampler2D InDepthSampler; // minecraft:main depth
+uniform sampler2D AtlasSampler;   // clod:textures/effect/atlas.png (RG = height, B = water)
+uniform sampler2D RotSampler;     // clod:clod_rot_a (1x1 persistent)
 
 layout(std140) uniform SamplerInfo {
     vec2 OutSize;
@@ -55,13 +55,13 @@ const int BISECT = 7;
 
 // Height (block Y) stored in the atlas: (y + 64) << 6, big-endian RG.
 float atlas_height(vec2 uv) {
-    vec4 a = texture(Atlas, uv);
+    vec4 a = texture(AtlasSampler, uv);
     float y16 = a.r * 65280.0 + a.g * 255.0; // r*255*256 + g*255
     return y16 / 64.0 - 64.0;
 }
 
 bool atlas_water(vec2 uv) {
-    return texture(Atlas, uv).b > 0.5;
+    return texture(AtlasSampler, uv).b > 0.5;
 }
 
 // Heightfield lookup in world space; clamps to the atlas edge (plateau).
@@ -78,15 +78,15 @@ bool world_water(vec2 xz, vec2 origin, float size) {
 }
 
 void main() {
-    vec4 scene = texture(In, texCoord);
-    float depth = texture(InDepth, texCoord).r;
+    vec4 scene = texture(InSampler, texCoord);
+    float depth = texture(InDepthSampler, texCoord).r;
 
     if (depth < SKY_DEPTH) {
         fragColor = scene;
         return;
     }
 
-    vec4 rot = texelFetch(Rot, ivec2(0), 0);
+    vec4 rot = texelFetch(RotSampler, ivec2(0), 0);
     float conf = rot.b;
     float minConf = LodParams.w;
     if (conf < minConf) {

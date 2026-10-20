@@ -92,6 +92,7 @@ pub struct Ids {
     m_key_key: jmethodID,
     m_pe_add: jmethodID,
     m_pe_remove: jmethodID,
+    m_pe_update: jmethodID,
 }
 
 static IDS: OnceLock<Option<SendIds>> = OnceLock::new();
@@ -453,6 +454,7 @@ fn resolve(env: Env) -> Option<Ids> {
         "remove",
         "(Lnet/kyori/adventure/key/Key;)Z"
     );
+    let m_pe_update = m!(post_effects_cls, "update", "()V");
 
     Some(Ids {
         bukkit_cls,
@@ -471,6 +473,7 @@ fn resolve(env: Env) -> Option<Ids> {
         m_key_key,
         m_pe_add,
         m_pe_remove,
+        m_pe_update,
     })
 }
 
@@ -799,6 +802,35 @@ pub fn push_pack(
 
     let args = [jv(pack_uuid), jv(jurl), jv(jarr), jv(jprompt), jz(force)];
     env.call_void_method(player, pids.m_set_resource_pack, &args);
+    if env.exception_check() {
+        // Surface the server-side failure instead of swallowing it: without
+        // this the pack silently never reaches the client.
+        env.exception_describe();
+        crate::log_info("pack push: setResourcePack threw (exception above)");
+    }
+    let ok = !env.exception_check();
+    clear_if_pending(env);
+    ok
+}
+
+/// Re-sends the player's current post-effect list to the client. The pack is
+/// static and the effect list is unchanged, so this is a no-op on the wire
+/// unless the client just finished applying the pack — in which case it lets
+/// the client resolve chains it couldn't load during the push/reload race.
+pub fn update_effects(env: Env, player: jobject) -> bool {
+    let Some(ids) = ids() else { return false };
+    let Some(pids) = player_ids(env, player) else {
+        clear_if_pending(env);
+        return false;
+    };
+    let Some(pe) = jobj(env.call_object_method(player, pids.m_post_effects, &[])) else {
+        clear_if_pending(env);
+        return false;
+    };
+    env.call_void_method(pe, ids.m_pe_update, &[]);
+    if env.exception_check() {
+        env.exception_describe();
+    }
     let ok = !env.exception_check();
     clear_if_pending(env);
     ok
