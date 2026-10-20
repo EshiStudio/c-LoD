@@ -65,10 +65,11 @@ pub fn build(cfg: &Config, atlas: &Atlas) -> Pack {
 
     let origin_x = atlas.center_x - atlas.half();
     let origin_z = atlas.center_z - atlas.half();
-    // Device-depth veil window: tuned so the last ~15% of real geometry
-    // before the far plane melts into the veil color.
-    let atmo_start = fmt_f(0.9990);
-    let atmo_end = fmt_f(0.99975);
+    // 26.3 veil window in EYE-SPACE BLOCKS (the shader converts device depth
+    // via eyeZ = depth_near / d): the veil starts taking over just before the
+    // LOD band begins and reaches full strength at `veil_far`.
+    let atmo_start = fmt_f(cfg.lod_near * 0.85);
+    let atmo_end = fmt_f(cfg.veil_far);
     let fog_start = cfg.lod_near * 1.05;
     let fog_end = atlas.size as f32 * 0.72;
 
@@ -105,6 +106,8 @@ pub fn build(cfg: &Config, atlas: &Atlas) -> Pack {
         ("__ATMO_START__", atmo_start),
         ("__ATMO_END__", atmo_end),
         ("__ATMO_STRENGTH__", fmt_f(0.92)),
+        // 26.3 device depth: d = depth_near / eyeZ (infinite far, sky == 0.0).
+        ("__DEPTH_NEAR__", fmt_f(cfg.depth_near)),
     ];
 
     let lod_terrain_json = substitute(lod_terrain_tpl, &map);

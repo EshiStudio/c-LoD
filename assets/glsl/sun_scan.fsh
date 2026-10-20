@@ -26,15 +26,17 @@ layout(std140) uniform ClodScan {
 layout(location = 0) in vec2 texCoord;
 layout(location = 0) out vec4 fragColor;
 
-const float SKY_DEPTH = 0.99995;
+const float GEOMETRY_DEPTH = 1.0e-6;
 
 void main() {
     float depth = texture(InDepthSampler, texCoord).r;
     vec3 col = texture(InSampler, texCoord).rgb;
 
+    // 26.3 device depth (live-verified): d = near/eyeZ, infinite far plane —
+    // the sky sits at EXACTLY 0.0; any real geometry reads positive values.
     // Sky pixels only: real geometry (and the LOD we draw later) never
     // writes to the far plane.
-    if (depth < SKY_DEPTH) {
+    if (depth > GEOMETRY_DEPTH) {
         fragColor = vec4(0.0);
         return;
     }

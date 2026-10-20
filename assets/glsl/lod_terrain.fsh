@@ -81,7 +81,11 @@ void main() {
     vec4 scene = texture(InSampler, texCoord);
     float depth = texture(InDepthSampler, texCoord).r;
 
-    if (depth < SKY_DEPTH) {
+    // 26.3 device depth (live-verified): d = near/eyeZ, infinite far plane —
+    // the sky and the sun/moon quads sit at EXACTLY 0.0, real terrain reads
+    // positive values that grow with proximity (12 m ≈ 0.004 at near 0.05).
+    // Real chunks always win: non-sky pixels pass through untouched.
+    if (depth > 1.0e-6) {
         fragColor = scene;
         return;
     }

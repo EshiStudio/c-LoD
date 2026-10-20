@@ -17,6 +17,9 @@
                 ],
                 "ClodAtmoColor": [
                     { "name": "VeilColor", "type": "vec4", "value": __VEIL_RGBA__ }
+                ],
+                "ClodDepth": [
+                    { "name": "DepthParams", "type": "vec4", "value": [__DEPTH_NEAR__, 0.0, 0.0, 0.0] }
                 ]
             }
         },

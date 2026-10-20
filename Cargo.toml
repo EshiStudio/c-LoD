@@ -1,6 +1,6 @@
 [package]
 name = "lod"
-version = "3.0.3"
+version = "4.0.0"
 edition = "2021"
 description = "c-LoD — true server-side LOD for Paper 26.3 via /posteffect + server resource pack. GLSL raymarched distant terrain from a heightmap atlas. No Display entities, no client mods."
 license = "MIT"

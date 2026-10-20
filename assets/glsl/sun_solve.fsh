@@ -107,7 +107,7 @@ void main() {
     float prevEl = prev.g * PI - PI * 0.5;
     float prevConf = prev.b;
 
-    vec4 outRot = vec4(prev.r, prev.g, prevConf * 0.94, 1.0);
+    vec4 outRot = vec4(prev.r, prev.g, prevConf * 0.99, 1.0);
 
     if (sw >= wThresh) {
         vec2 meas = vec2(su / sw, sv / sw);

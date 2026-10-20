@@ -58,6 +58,10 @@ pub struct Config {
     pub lod_near: f32,
     /// Effective maximum distance of the atmosphere veil (blocks).
     pub veil_far: f32,
+    /// 26.3 device-depth near plane (blocks): device d = depth_near / eyeZ.
+    /// Live-verified on a real client (sky reads exactly 0.0); 0.05 is the
+    /// vanilla camera near plane. Only touch if Mojang changes the mapping.
+    pub depth_near: f32,
     /// Sea level used for water flagging and LOD water rendering.
     pub sea_level: i32,
     /// Engine tick interval in milliseconds.
@@ -99,6 +103,7 @@ impl Default for Config {
             fov: 70.0,
             lod_near: 96.0,
             veil_far: 512.0,
+            depth_near: 0.05,
             sea_level: 63,
             tick_ms: 1000,
             effect_terrain: "clod:lod_terrain".to_string(),
@@ -194,6 +199,11 @@ impl Config {
         if let Some(v) = get("veil_far").and_then(|v| v.parse::<f32>().ok()) {
             if (128.0..=16384.0).contains(&v) {
                 cfg.veil_far = v;
+            }
+        }
+        if let Some(v) = get("depth_near").and_then(|v| v.parse::<f32>().ok()) {
+            if (0.01..=1.0).contains(&v) {
+                cfg.depth_near = v;
             }
         }
         if let Some(v) = get("sea_level").and_then(|v| v.parse::<i32>().ok()) {
