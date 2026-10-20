@@ -70,9 +70,12 @@ Options string passed through the CRUSSTY runtime (`key=value;key=value`):
 | `atlas_size` | `4096` | Side length in blocks (power of two, 512–16384) |
 | `cell_size` | `4` | Blocks per atlas texel (power of two) |
 | `scan_budget` | `4096` | Heightmap cells scanned per engine tick |
-| `refresh_secs` | `300` | Minimum seconds between pack rebuilds |
+| `scan_deadline_secs` | `900` | Static-pack scan deadline: the pack is built EXACTLY ONCE when the sweep completes or this fires — never rebuilt, never re-pushed |
+| `atlas_cache` | `true` | Persist the finalized atlas to `atlas_path` so restarts reproduce byte-identical packs (same SHA-1 — clients never re-download) |
+| `atlas_path` | `c-LoD-atlas.bin` | Where the atlas snapshot is persisted |
+| `tick_ms` | `1000` | Engine tick interval (scan + per-player tier switching) |
 | `fov` | `70` | Vertical FOV the GLSL ray reconstruction assumes (client FOV) |
-| `lod_near` | `256` | LOD raymarch starts here (keep above view distance) |
+| `lod_near` | `96` | LOD raymarch starts here (keep BELOW the client view distance: real chunks win by depth, LOD fills underneath the chunk edge — no seam) |
 | `sea_level` | `63` | Water level |
 | `color_low/color_high/color_water/color_veil` | defaults | Palette, `r/g/b` floats or 0–255 |
 | `snow_line` | `0.78` | Snow blend point (normalized elevation) |

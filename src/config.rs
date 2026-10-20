@@ -31,13 +31,25 @@ pub struct Config {
     pub cell_size: i32,
     /// Heightmap cells scanned per engine tick (main-thread JNI budget).
     pub scan_budget: u32,
-    /// Seconds between full atlas refresh sweeps.
-    pub refresh_secs: u64,
+    /// Static-pack scan deadline: seconds from atlas-world resolution until
+    /// the heightmap sweep is finalized with whatever it has. The pack is
+    /// built EXACTLY ONCE per session — either when the sweep completes or
+    /// when this deadline fires, never before, never again.
+    pub scan_deadline_secs: u64,
+    /// Persist the finalized atlas to `atlas_path` (default
+    /// `c-LoD-atlas.bin` next to the server) so restarts rebuild the exact
+    /// same pack bytes (same SHA-1) and vanilla clients never re-download.
+    pub atlas_cache: bool,
+    /// Where the atlas snapshot is persisted.
+    pub atlas_path: String,
     /// Camera FOV (vertical, degrees) the GLSL ray reconstruction assumes.
     /// Must match the client's FOV for pixel-perfect alignment; 70 is vanilla.
     pub fov: f32,
-    /// Distance (blocks) where the LOD raymarch starts. Keep above the
-    /// server's view distance so real chunks never overlap LOD.
+    /// Distance (blocks) where the LOD raymarch starts. Keep it BELOW the
+    /// client view distance: the chain only paints sky-depth pixels, so real
+    /// chunks always win by depth and the LOD fills underneath the chunk edge
+    /// — the seamless blend DH-style packs achieve (a start above the view
+    /// distance leaves the dreaded gap between real terrain and LOD).
     pub lod_near: f32,
     /// Effective maximum distance of the atmosphere veil (blocks).
     pub veil_far: f32,
@@ -75,9 +87,11 @@ impl Default for Config {
             atlas_size: 4096,
             cell_size: 4,
             scan_budget: 4096,
-            refresh_secs: 300,
+            scan_deadline_secs: 900,
+            atlas_cache: true,
+            atlas_path: "c-LoD-atlas.bin".to_string(),
             fov: 70.0,
-            lod_near: 256.0,
+            lod_near: 96.0,
             veil_far: 512.0,
             sea_level: 63,
             tick_ms: 1000,
@@ -143,8 +157,20 @@ impl Config {
         if let Some(v) = get("scan_budget").and_then(|v| v.parse::<u32>().ok()) {
             cfg.scan_budget = v.clamp(64, 65536);
         }
-        if let Some(v) = get("refresh_secs").and_then(|v| v.parse::<u64>().ok()) {
-            cfg.refresh_secs = v.clamp(30, 86400);
+        if let Some(v) = get("scan_deadline_secs").and_then(|v| v.parse::<u64>().ok()) {
+            cfg.scan_deadline_secs = v.clamp(10, 86400);
+        }
+        if let Some(v) = get("atlas_cache") {
+            cfg.atlas_cache = !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "false" | "0" | "off" | "no"
+            );
+        }
+        if let Some(v) = get("atlas_path") {
+            let v = v.trim();
+            if !v.is_empty() {
+                cfg.atlas_path = v.to_string();
+            }
         }
         if let Some(v) = get("fov").and_then(|v| v.parse::<f32>().ok()) {
             if (30.0..=150.0).contains(&v) {
@@ -246,6 +272,19 @@ mod tests {
     fn rejects_bad_atlas_size() {
         let c = Config::parse("atlas_size=3000");
         assert_eq!(c.atlas_size, 4096);
+    }
+
+    #[test]
+    fn static_pack_options() {
+        let c = Config::parse("");
+        assert_eq!(c.scan_deadline_secs, 900);
+        assert!(c.atlas_cache);
+        assert_eq!(c.atlas_path, "c-LoD-atlas.bin");
+
+        let c = Config::parse("scan_deadline_secs=7;atlas_cache=off;atlas_path=/tmp/atlas.bin");
+        assert_eq!(c.scan_deadline_secs, 10, "clamped to minimum");
+        assert!(!c.atlas_cache);
+        assert_eq!(c.atlas_path, "/tmp/atlas.bin");
     }
 
     #[test]

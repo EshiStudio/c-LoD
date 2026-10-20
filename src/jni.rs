@@ -18,10 +18,25 @@
 //!   - PlayerPostEffects.add/remove(Key)        -> boolean
 //!   - Key.key(String)                          -> Key (static, adventure)
 //!   - UUID.fromString(String)                  -> UUID (static)
+//!
+//! CLASS RESOLUTION RULES (hard-won against Paper 26.3's layered loaders):
+//!   1. NEVER plain JNI FindClass from our callbacks — it sees only the
+//!      system loader and a pending NoClassDefFoundError escaping the native
+//!      frame kills the server tick.
+//!   2. The JVMTI GetLoadedClasses scan finds classes across ALL loaders,
+//!      but with several loaders hosting same-named API classes it can pick
+//!      a duplicate whose method table mismatches (GetMethodID silently
+//!      returns NULL). The scan is used ONLY for java.* bootstrap classes
+//!      (single copy) and org/bukkit/Bukkit (verified against getServer).
+//!   3. Everything else is resolved on the CONCRETE class of a live object
+//!      (CraftServer / CraftWorld / CraftPlayer / CraftBlock / Location) via
+//!      GetObjectClass — the exact class that actually implements the call.
+//!      adventure Key and PlayerPostEffects come from Class.forName through
+//!      CraftServer's own loader (exact same-loader Class object).
 
 use jvmti_bindings::jni::{jboolean, jint, jmethodID, jobject, jstring, jvalue};
 use jvmti_bindings::prelude::JniEnv;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 type Env<'a> = &'a JniEnv;
 
@@ -55,7 +70,11 @@ fn jstr(env: Env, o: jobject) -> Option<String> {
     jobj(o).and_then(|o| env.get_string_utf(o as jstring))
 }
 
-struct Ids {
+// ---------------------------------------------------------------------------
+// Static surface: resolved once (see resolve()).
+// ---------------------------------------------------------------------------
+
+pub struct Ids {
     bukkit_cls: jobject,
     m_get_server: jmethodID,
     m_server_players: jmethodID,
@@ -68,18 +87,7 @@ struct Ids {
     uuid_cls: jobject,
     m_uuid_to_string: jmethodID,
     m_uuid_from_string: jmethodID,
-    m_get_unique_id: jmethodID,
-    m_get_location: jmethodID,
-    m_set_resource_pack: jmethodID,
-    m_post_effects: jmethodID,
-    m_get_block_x: jmethodID,
-    m_get_block_y: jmethodID,
-    m_get_block_z: jmethodID,
-    m_loc_get_world: jmethodID,
-    m_world_name: jmethodID,
-    m_highest_block: jmethodID,
-    m_get_block_at: jmethodID,
-    m_is_liquid: jmethodID,
+    /// Exact adventure Key class from CraftServer's loader.
     key_cls: jobject,
     m_key_key: jmethodID,
     m_pe_add: jmethodID,
@@ -95,41 +103,271 @@ struct SendIds(Ids);
 unsafe impl Send for SendIds {}
 unsafe impl Sync for SendIds {}
 
-/// Resolve all classes/method IDs once. Returns None on any miss; bridge
-/// functions then no-op instead of crashing the JVM on a null ID.
+fn ids() -> Option<&'static Ids> {
+    IDS.get().and_then(|o| o.as_ref()).map(|s| &s.0)
+}
+
+// ---------------------------------------------------------------------------
+// Lazy surfaces: concrete-class method IDs resolved on first live object.
+// All main-thread-only; Mutex<Option<_>> allows cheap retry until available.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+struct WorldIds {
+    m_name: jmethodID,
+    m_highest_block: jmethodID,
+    m_get_block_at: jmethodID,
+    m_chunk_loaded: jmethodID,
+}
+// Raw method-ID pointers cached process-lifetime; consumed main-thread-only.
+unsafe impl Send for WorldIds {}
+static WORLD_IDS: Mutex<Option<WorldIds>> = Mutex::new(None);
+
+#[derive(Clone, Copy)]
+struct PlayerIds {
+    m_get_unique_id: jmethodID,
+    m_get_location: jmethodID,
+    m_post_effects: jmethodID,
+    m_set_resource_pack: jmethodID,
+}
+// Raw method-ID pointers cached process-lifetime; consumed main-thread-only.
+unsafe impl Send for PlayerIds {}
+static PLAYER_IDS: Mutex<Option<PlayerIds>> = Mutex::new(None);
+
+#[derive(Clone, Copy)]
+struct LocationIds {
+    m_get_block_x: jmethodID,
+    m_get_block_y: jmethodID,
+    m_get_block_z: jmethodID,
+    m_loc_get_world: jmethodID,
+}
+// Raw method-ID pointers cached process-lifetime; consumed main-thread-only.
+unsafe impl Send for LocationIds {}
+static LOCATION_IDS: Mutex<Option<LocationIds>> = Mutex::new(None);
+
+#[derive(Clone, Copy)]
+struct BlockIds {
+    m_is_liquid: jmethodID,
+}
+// Raw method-ID pointers cached process-lifetime; consumed main-thread-only.
+unsafe impl Send for BlockIds {}
+static BLOCK_IDS: Mutex<Option<BlockIds>> = Mutex::new(None);
+
+fn method_or_log(env: Env, cls: jobject, name: &str, sig: &str) -> Option<jmethodID> {
+    // The FIRST GetMethodID on a freshly-seen class can fail spuriously
+    // under this JVMTI agent (NULL result, no pending exception) while the
+    // immediate retry binds — a one-shot class-priming effect observed live.
+    // Never give up on the first NULL; retry once before reporting failure.
+    if let Some(id) = env.get_method_id(cls, name, sig) {
+        clear_if_pending(env);
+        return Some(id);
+    }
+    env.exception_clear();
+    match env.get_method_id(cls, name, sig) {
+        Some(id) => {
+            clear_if_pending(env);
+            Some(id)
+        }
+        None => {
+            eprintln!("[c-LoD] method resolve FAILED: {name} {sig}");
+            if env.exception_check() {
+                env.exception_describe();
+                env.exception_clear();
+            }
+            None
+        }
+    }
+}
+
+fn world_ids(env: Env, world: jobject) -> Option<WorldIds> {
+    if let Some(w) = WORLD_IDS.lock().unwrap().as_ref() {
+        return Some(*w);
+    }
+    let cls_local = env.get_object_class(world);
+    let cls = {
+        let g = env.new_global_ref(cls_local);
+        g as jobject
+    };
+    let ids = WorldIds {
+        m_name: bind_method(env, cls_local, cls, "getName", "()Ljava/lang/String;")?,
+        m_highest_block: bind_method(env, cls_local, cls, "getHighestBlockYAt", "(II)I")?,
+        m_chunk_loaded: bind_method(env, cls_local, cls, "isChunkLoaded", "(II)Z")?,
+        m_get_block_at: bind_method(
+            env,
+            cls_local,
+            cls,
+            "getBlockAt",
+            "(III)Lorg/bukkit/block/Block;",
+        )?,
+    };
+    *WORLD_IDS.lock().unwrap() = Some(ids);
+    Some(ids)
+}
+
+fn player_ids(env: Env, player: jobject) -> Option<PlayerIds> {
+    if let Some(p) = PLAYER_IDS.lock().unwrap().as_ref() {
+        return Some(*p);
+    }
+    let cls_local = env.get_object_class(player);
+    let cls = {
+        let g = env.new_global_ref(cls_local);
+        g as jobject
+    };
+    let ids = PlayerIds {
+        m_get_unique_id: bind_method(env, cls_local, cls, "getUniqueId", "()Ljava/util/UUID;")?,
+        m_get_location: bind_method(
+            env,
+            cls_local,
+            cls,
+            "getLocation",
+            "()Lorg/bukkit/Location;",
+        )?,
+        m_post_effects: bind_method(
+            env,
+            cls_local,
+            cls,
+            "postEffects",
+            "()Lio/papermc/paper/entity/PlayerPostEffects;",
+        )?,
+        m_set_resource_pack: bind_method(
+            env,
+            cls_local,
+            cls,
+            "setResourcePack",
+            "(Ljava/util/UUID;Ljava/lang/String;[BLjava/lang/String;Z)V",
+        )?,
+    };
+    *PLAYER_IDS.lock().unwrap() = Some(ids);
+    Some(ids)
+}
+
+fn location_ids(env: Env, loc: jobject) -> Option<LocationIds> {
+    if let Some(l) = LOCATION_IDS.lock().unwrap().as_ref() {
+        return Some(*l);
+    }
+    let cls_local = env.get_object_class(loc);
+    let cls = {
+        let g = env.new_global_ref(cls_local);
+        g as jobject
+    };
+    let ids = LocationIds {
+        m_get_block_x: bind_method(env, cls_local, cls, "getBlockX", "()I")?,
+        m_get_block_y: bind_method(env, cls_local, cls, "getBlockY", "()I")?,
+        m_get_block_z: bind_method(env, cls_local, cls, "getBlockZ", "()I")?,
+        m_loc_get_world: bind_method(env, cls_local, cls, "getWorld", "()Lorg/bukkit/World;")?,
+    };
+    *LOCATION_IDS.lock().unwrap() = Some(ids);
+    Some(ids)
+}
+
+fn block_ids(env: Env, block: jobject) -> Option<BlockIds> {
+    if let Some(b) = BLOCK_IDS.lock().unwrap().as_ref() {
+        return Some(*b);
+    }
+    let cls_local = env.get_object_class(block);
+    let cls = {
+        let g = env.new_global_ref(cls_local);
+        g as jobject
+    };
+    let ids = BlockIds {
+        m_is_liquid: bind_method(env, cls_local, cls, "isLiquid", "()Z")?,
+    };
+    *BLOCK_IDS.lock().unwrap() = Some(ids);
+    Some(ids)
+}
+
+// ---------------------------------------------------------------------------
+// One-time resolve of the static surface.
+// ---------------------------------------------------------------------------
+
+/// Bind a virtual method through the probe-then-globalize sequence that
+/// works under this agent (see resolve(): local-ref GetMethodID fails
+/// silently until the class was forced to link by a local probe).
+fn bind_method(
+    env: Env,
+    local_cls: jobject,
+    global_cls: jobject,
+    name: &str,
+    sig: &str,
+) -> Option<jmethodID> {
+    let _ = env.get_method_id(local_cls, name, sig); // probe: may fail, primes the class
+    env.exception_clear();
+    match env.get_method_id(global_cls, name, sig) {
+        Some(id) => {
+            clear_if_pending(env);
+            Some(id)
+        }
+        None => {
+            eprintln!("[c-LoD] method resolve FAILED: {name} {sig}");
+            if env.exception_check() {
+                env.exception_describe();
+                env.exception_clear();
+            }
+            None
+        }
+    }
+}
+
 fn resolve(env: Env) -> Option<Ids> {
+    use cplug_sdk::classes as sdkcls;
+
+    // JVMTI scan (loader-independent) — ONLY for single-copy bootstrap
+    // classes and Bukkit. Anything Paper-API-specific uses live objects.
     macro_rules! cls {
-        ($name:expr) => {
-            env.find_class($name)?
-        };
+        ($name:expr) => {{
+            match sdkcls::find_class($name) {
+                Some(c) => {
+                    clear_if_pending(env);
+                    c.as_jclass()
+                }
+                None => {
+                    eprintln!("[c-LoD] class resolve FAILED: {}", $name);
+                    return None;
+                }
+            }
+        }};
     }
     macro_rules! m {
         ($c:expr, $n:expr, $s:expr) => {
-            env.get_method_id($c, $n, $s)?
+            method_or_log(env, $c, $n, $s)?
         };
     }
     macro_rules! sm {
         ($c:expr, $n:expr, $s:expr) => {
-            env.get_static_method_id($c, $n, $s)?
+            match env.get_static_method_id($c, $n, $s) {
+                Some(id) => {
+                    clear_if_pending(env);
+                    id
+                }
+                None => {
+                    eprintln!("[c-LoD] static method resolve FAILED: {} {}", $n, $s);
+                    if env.exception_check() {
+                        env.exception_describe();
+                        env.exception_clear();
+                    }
+                    return None;
+                }
+            }
         };
     }
 
-    let bukkit_cls = cls!("org/bukkit/Bukkit");
-    let server_cls = cls!("org/bukkit/Server");
+    // Bootstrap classes live in a single stable copy — the JVMTI scan is
+    // safe for them. EVERYTHING from paper-api is resolved through
+    // Class.forName in CraftServer's own loader instead: the scan can grab
+    // an API class mid-redefinition (Paper remaps API classes during boot)
+    // and cache a stale global ref whose method table mismatches forever
+    // (GetMethodID silently returns NULL for every method).
     let collection_cls = cls!("java/util/Collection");
     let iterator_cls = cls!("java/util/Iterator");
     let list_cls = cls!("java/util/List");
     let uuid_cls = cls!("java/util/UUID");
-    let player_cls = cls!("org/bukkit/entity/Player");
-    let location_cls = cls!("org/bukkit/Location");
-    let world_cls = cls!("org/bukkit/World");
-    let block_cls = cls!("org/bukkit/block/Block");
-    let key_cls = cls!("net/kyori/adventure/key/Key");
-    let post_effects_cls = cls!("io/papermc/paper/entity/PlayerPostEffects");
+    let class_cls = cls!("java/lang/Class");
 
-    let m_get_server = sm!(bukkit_cls, "getServer", "()Lorg/bukkit/Server;");
-    let m_server_players = m!(server_cls, "getOnlinePlayers", "()Ljava/lang/Collection;");
-    let m_server_worlds = m!(server_cls, "getWorlds", "()Ljava/util/List;");
+    let m_for_name = sm!(
+        class_cls,
+        "forName",
+        "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;"
+    );
     let m_iterator = m!(collection_cls, "iterator", "()Ljava/util/Iterator;");
     let m_has_next = m!(iterator_cls, "hasNext", "()Z");
     let m_next = m!(iterator_cls, "next", "()Ljava/lang/Object;");
@@ -141,26 +379,67 @@ fn resolve(env: Env) -> Option<Ids> {
         "fromString",
         "(Ljava/lang/String;)Ljava/util/UUID;"
     );
-    let m_get_unique_id = m!(player_cls, "getUniqueId", "()Ljava/util/UUID;");
-    let m_get_location = m!(player_cls, "getLocation", "()Lorg/bukkit/Location;");
-    let m_set_resource_pack = m!(
-        player_cls,
-        "setResourcePack",
-        "(Ljava/util/UUID;Ljava/lang/String;[BLjava/lang/String;Z)V"
-    );
-    let m_post_effects = m!(
-        player_cls,
-        "postEffects",
-        "()Lio/papermc/paper/entity/PlayerPostEffects;"
-    );
-    let m_get_block_x = m!(location_cls, "getBlockX", "()I");
-    let m_get_block_y = m!(location_cls, "getBlockY", "()I");
-    let m_get_block_z = m!(location_cls, "getBlockZ", "()I");
-    let m_loc_get_world = m!(location_cls, "getWorld", "()Lorg/bukkit/World;");
-    let m_world_name = m!(world_cls, "getName", "()Ljava/lang/String;");
-    let m_highest_block = m!(world_cls, "getHighestBlockYAt", "(II)I");
-    let m_get_block_at = m!(world_cls, "getBlockAt", "(III)Lorg/bukkit/block/Block;");
-    let m_is_liquid = m!(block_cls, "isLiquid", "()Z");
+
+    // Probe the live server through the scanned Bukkit (bootstrap-adjacent,
+    // verified working: getServer is its only use) — the probe object is
+    // then the ground truth for CraftServer's loader.
+    let bukkit_probe = cls!("org/bukkit/Bukkit");
+    let m_get_server_probe = sm!(bukkit_probe, "getServer", "()Lorg/bukkit/Server;");
+    let server_obj = jobj(env.call_static_object_method(bukkit_probe, m_get_server_probe, &[]));
+    clear_if_pending(env);
+    let server_obj = server_obj?;
+
+    // Live server -> concrete CraftServer class -> server-surface methods.
+    let server_cls = env.get_object_class(server_obj);
+
+    // Force-load + initialize the API classes in CraftServer's loader and
+    // keep the EXACT Class objects (no scan ambiguity, no stale cache):
+    // server.getClass().getClassLoader() -> Class.forName(name, true, cl).
+    let m_get_class = m!(class_cls, "getClass", "()Ljava/lang/Class;");
+    let m_get_class_loader = m!(class_cls, "getClassLoader", "()Ljava/lang/ClassLoader;");
+    let k = jobj(env.call_object_method(server_obj, m_get_class, &[]));
+    let loader = k.and_then(|k| jobj(env.call_object_method(k, m_get_class_loader, &[])));
+    let loader = loader?;
+    let force_load = |dotted: &str| -> Option<jobject> {
+        let jn = env.new_string_utf(dotted)?;
+        let k =
+            env.call_static_object_method(class_cls, m_for_name, &[jv(jn), jz(true), jv(loader)]);
+        clear_if_pending(env);
+        jobj(k)
+    };
+
+    let bukkit_cls = force_load("org.bukkit.Bukkit")?;
+    let key_cls = force_load("net.kyori.adventure.key.Key")?;
+    let post_effects_cls = force_load("io.papermc.paper.entity.PlayerPostEffects")?;
+    // getServer re-resolved on the EXACT Bukkit class from this loader.
+    let m_get_server = sm!(bukkit_cls, "getServer", "()Lorg/bukkit/Server;");
+
+    // JNI quirk discovered live under this JVMTI agent: GetMethodID on a
+    // LOCAL-ref jclass returns NULL (no pending exception); the SAME class
+    // through a GLOBAL ref binds — but only after a failed local-ref attempt
+    // forced the class to finish linking (probe-then-globalize,
+    // see bind_method). Used for every Paper-API method below.
+    let server_cls_local = server_cls;
+    let server_cls = {
+        let g = env.new_global_ref(server_cls);
+        g as jobject
+    };
+
+    let m_server_players = bind_method(
+        env,
+        server_cls_local,
+        server_cls,
+        "getOnlinePlayers",
+        "()Ljava/util/Collection;",
+    )?;
+    let m_server_worlds = bind_method(
+        env,
+        server_cls_local,
+        server_cls,
+        "getWorlds",
+        "()Ljava/util/List;",
+    )?;
+    #[allow(clippy::used_underscore_binding)]
     let m_key_key = sm!(
         key_cls,
         "key",
@@ -186,18 +465,6 @@ fn resolve(env: Env) -> Option<Ids> {
         uuid_cls,
         m_uuid_to_string,
         m_uuid_from_string,
-        m_get_unique_id,
-        m_get_location,
-        m_set_resource_pack,
-        m_post_effects,
-        m_get_block_x,
-        m_get_block_y,
-        m_get_block_z,
-        m_loc_get_world,
-        m_world_name,
-        m_highest_block,
-        m_get_block_at,
-        m_is_liquid,
         key_cls,
         m_key_key,
         m_pe_add,
@@ -205,13 +472,24 @@ fn resolve(env: Env) -> Option<Ids> {
     })
 }
 
-/// Resolve IDs (idempotent). Call once on the main thread during boot.
+/// Resolve IDs. Call from the main thread each tick until it returns true.
+///
+/// The static surface requires a live server object (CraftServer methods),
+/// which only exists after Bukkit.setServer — before that, retry next tick.
 pub fn warmup(env: Env) -> bool {
-    IDS.get_or_init(|| resolve(env).map(SendIds)).is_some()
-}
-
-fn ids() -> Option<&'static Ids> {
-    IDS.get().and_then(|o| o.as_ref()).map(|s| &s.0)
+    if let Some(s) = IDS.get() {
+        return s.is_some();
+    }
+    match resolve(env) {
+        Some(ids) => {
+            let _ = IDS.set(Some(SendIds(ids)));
+            true
+        }
+        None => {
+            clear_if_pending(env);
+            false
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -263,8 +541,12 @@ pub fn players(env: Env) -> Vec<PlayerInfo> {
         let Some(player) = jobj(env.call_object_method(iterator, ids.m_next, &[])) else {
             break;
         };
+        let Some(pids) = player_ids(env, player) else {
+            clear_if_pending(env);
+            continue;
+        };
 
-        let Some(uuid) = jobj(env.call_object_method(player, ids.m_get_unique_id, &[]))
+        let Some(uuid) = jobj(env.call_object_method(player, pids.m_get_unique_id, &[]))
             .and_then(|u| jobj(env.call_object_method(u, ids.m_uuid_to_string, &[])))
             .and_then(|s| jstr(env, s))
         else {
@@ -272,15 +554,23 @@ pub fn players(env: Env) -> Vec<PlayerInfo> {
             continue;
         };
 
-        let Some(loc) = jobj(env.call_object_method(player, ids.m_get_location, &[])) else {
+        let Some(loc) = jobj(env.call_object_method(player, pids.m_get_location, &[])) else {
             clear_if_pending(env);
             continue;
         };
-        let bx = env.call_int_method(loc, ids.m_get_block_x, &[]);
-        let by = env.call_int_method(loc, ids.m_get_block_y, &[]);
-        let bz = env.call_int_method(loc, ids.m_get_block_z, &[]);
-        let world = jobj(env.call_object_method(loc, ids.m_loc_get_world, &[]))
-            .and_then(|w| jstr(env, name_of(env, ids, w)))
+        let Some(lids) = location_ids(env, loc) else {
+            clear_if_pending(env);
+            continue;
+        };
+        let bx = env.call_int_method(loc, lids.m_get_block_x, &[]);
+        let by = env.call_int_method(loc, lids.m_get_block_y, &[]);
+        let bz = env.call_int_method(loc, lids.m_get_block_z, &[]);
+        let world = jobj(env.call_object_method(loc, lids.m_loc_get_world, &[]))
+            .and_then(|w| {
+                let wid = world_ids(env, w)?;
+                jobj(env.call_object_method(w, wid.m_name, &[]))
+            })
+            .and_then(|s| jstr(env, s))
             .unwrap_or_default();
         clear_if_pending(env);
 
@@ -296,10 +586,6 @@ pub fn players(env: Env) -> Vec<PlayerInfo> {
     out
 }
 
-fn name_of(env: Env, ids: &Ids, world: jobject) -> jobject {
-    env.call_object_method(world, ids.m_world_name, &[])
-}
-
 /// World handle by name (first world when `name` is empty).
 pub fn find_world(env: Env, name: &str) -> Option<WorldRef> {
     let ids = ids()?;
@@ -311,7 +597,13 @@ pub fn find_world(env: Env, name: &str) -> Option<WorldRef> {
             clear_if_pending(env);
             continue;
         };
-        let Some(wname) = jobj(name_of(env, ids, world)).and_then(|s| jstr(env, s)) else {
+        let Some(wid) = world_ids(env, world) else {
+            clear_if_pending(env);
+            continue;
+        };
+        let Some(wname) =
+            jobj(env.call_object_method(world, wid.m_name, &[])).and_then(|s| jstr(env, s))
+        else {
             clear_if_pending(env);
             continue;
         };
@@ -322,17 +614,30 @@ pub fn find_world(env: Env, name: &str) -> Option<WorldRef> {
             });
         }
     }
+    clear_if_pending(env);
     None
 }
 
 /// Sample the surface height at one column. Returns (blockY, isLiquid).
 pub fn sample_height(env: Env, world: jobject, x: i32, z: i32) -> Option<(i32, bool)> {
-    let ids = ids()?;
+    let wid = world_ids(env, world)?;
     if env.exception_check() {
         env.exception_clear();
         return None;
     }
-    let y = env.call_int_method(world, ids.m_highest_block, &[ji(x), ji(z)]);
+    // Only sample loaded chunks: getHighestBlockYAt would otherwise force
+    // synchronous chunk generation and stall the main thread for minutes.
+    // Unloaded cells stay invalid and get picked up by later sweeps (the
+    // scan task wraps around the atlas) once players load those chunks.
+    let loaded = env.call_boolean_method(world, wid.m_chunk_loaded, &[ji(x >> 4), ji(z >> 4)]);
+    if env.exception_check() {
+        env.exception_clear();
+        return None;
+    }
+    if !loaded {
+        return None;
+    }
+    let y = env.call_int_method(world, wid.m_highest_block, &[ji(x), ji(z)]);
     if env.exception_check() {
         env.exception_clear();
         return None;
@@ -341,12 +646,16 @@ pub fn sample_height(env: Env, world: jobject, x: i32, z: i32) -> Option<(i32, b
         return Some((y, false));
     }
     let Some(block) =
-        jobj(env.call_object_method(world, ids.m_get_block_at, &[ji(x), ji(y), ji(z)]))
+        jobj(env.call_object_method(world, wid.m_get_block_at, &[ji(x), ji(y), ji(z)]))
     else {
         clear_if_pending(env);
         return Some((y, false));
     };
-    let liquid = env.call_boolean_method(block, ids.m_is_liquid, &[]);
+    let Some(bid) = block_ids(env, block) else {
+        clear_if_pending(env);
+        return Some((y, false));
+    };
+    let liquid = env.call_boolean_method(block, bid.m_is_liquid, &[]);
     clear_if_pending(env);
     Some((y, liquid))
 }
@@ -382,7 +691,11 @@ pub fn player_by_uuid(env: Env, uuid: &str) -> Option<jobject> {
         let Some(player) = jobj(env.call_object_method(iterator, ids.m_next, &[])) else {
             break;
         };
-        let Some(puuid) = jobj(env.call_object_method(player, ids.m_get_unique_id, &[]))
+        let Some(pids) = player_ids(env, player) else {
+            clear_if_pending(env);
+            continue;
+        };
+        let Some(puuid) = jobj(env.call_object_method(player, pids.m_get_unique_id, &[]))
             .and_then(|u| jobj(env.call_object_method(u, ids.m_uuid_to_string, &[])))
             .and_then(|s| jstr(env, s))
         else {
@@ -406,7 +719,13 @@ pub fn push_pack(
     prompt: &str,
     force: bool,
 ) -> bool {
-    let Some(ids) = ids() else { return false };
+    if ids().is_none() {
+        return false; // bridge not resolved yet
+    }
+    let Some(pids) = player_ids(env, player) else {
+        clear_if_pending(env);
+        return false;
+    };
     let Some(jurl) = env.new_string_utf(url) else {
         return false;
     };
@@ -420,7 +739,7 @@ pub fn push_pack(
     env.set_byte_array_region(jarr, 0, 20, &bytes);
 
     let args = [jv(pack_uuid), jv(jurl), jv(jarr), jv(jprompt), jz(force)];
-    env.call_void_method(player, ids.m_set_resource_pack, &args);
+    env.call_void_method(player, pids.m_set_resource_pack, &args);
     let ok = !env.exception_check();
     clear_if_pending(env);
     ok
@@ -428,7 +747,11 @@ pub fn push_pack(
 
 pub fn add_effect(env: Env, player: jobject, key: jobject) -> bool {
     let Some(ids) = ids() else { return false };
-    let Some(pe) = jobj(env.call_object_method(player, ids.m_post_effects, &[])) else {
+    let Some(pids) = player_ids(env, player) else {
+        clear_if_pending(env);
+        return false;
+    };
+    let Some(pe) = jobj(env.call_object_method(player, pids.m_post_effects, &[])) else {
         clear_if_pending(env);
         return false;
     };
@@ -439,7 +762,11 @@ pub fn add_effect(env: Env, player: jobject, key: jobject) -> bool {
 
 pub fn remove_effect(env: Env, player: jobject, key: jobject) -> bool {
     let Some(ids) = ids() else { return false };
-    let Some(pe) = jobj(env.call_object_method(player, ids.m_post_effects, &[])) else {
+    let Some(pids) = player_ids(env, player) else {
+        clear_if_pending(env);
+        return false;
+    };
+    let Some(pe) = jobj(env.call_object_method(player, pids.m_post_effects, &[])) else {
         clear_if_pending(env);
         return false;
     };

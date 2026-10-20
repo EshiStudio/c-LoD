@@ -13,6 +13,9 @@ pub struct Pack {
     pub zip: Vec<u8>,
     pub sha1: [u8; 20],
     pub sha1_hex: String,
+    /// Atlas version at build time (logging only — the pack bytes themselves
+    /// are deterministic and never depend on the internal version counter).
+    #[allow(dead_code)]
     pub atlas_version: u64,
 }
 
@@ -111,9 +114,7 @@ pub fn build(cfg: &Config, atlas: &Atlas) -> Pack {
     let clod_blit = include_str!("../assets/glsl/clod_blit.fsh");
     let atmosphere = include_str!("../assets/glsl/atmosphere.fsh");
 
-    let mcmeta = format!(
-        "{{\"pack\":{{\"pack_format\":97,\"description\":\"c-LoD LOD terrain (atlas v{atlas_version})\"}}}}"
-    );
+    let mcmeta = "{\"pack\":{\"pack_format\":97,\"description\":\"c-LoD v3 static LOD terrain (posteffect + heightfield raymarch)\"}}".to_string();
 
     let (aw, ah, atlas_rgba) = atlas.encode_rgba();
     let atlas_png = png::encode_png(aw, ah, &atlas_rgba);
@@ -200,6 +201,26 @@ mod tests {
         let s = String::from_utf8_lossy(pack.zip.as_slice());
         assert!(!s.contains("__FOV__"), "tokens must be substituted");
         let _ = zipw::crc32(pack.zip.as_slice());
+    }
+
+    #[test]
+    fn pack_bytes_are_deterministic_across_atlas_instances() {
+        // Static-pack SHA-1 stability: two independent atlases with the same
+        // cell data (e.g. live vs restored from disk) must produce the exact
+        // same pack bytes, regardless of internal version counters.
+        let cfg = Config::parse("");
+        let a = Atlas::new(0, 0, 256, 4, 63);
+        a.set(1, 1, 90, false);
+        a.set(2, 2, 40, true);
+        let pack_a = build(&cfg, &a);
+
+        let b = Atlas::new(0, 0, 256, 4, 63);
+        b.set(1, 1, 90, false);
+        b.set(2, 2, 40, true);
+        let pack_b = build(&cfg, &b);
+
+        assert_eq!(pack_a.zip, pack_b.zip, "pack bytes must be deterministic");
+        assert_eq!(pack_a.sha1_hex, pack_b.sha1_hex);
     }
 
     #[test]

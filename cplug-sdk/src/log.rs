@@ -52,29 +52,58 @@ fn emit(level: Level, msg: &str) {
     if cache.is_none() {
         *cache = resolve();
     }
-    let Some(ids) = cache.as_ref() else {
+    let Some(resolved) = cache.as_ref() else {
         eprintln!("[cplug-sdk] log dropped (kernel not ready): {msg}");
         return;
     };
     let mid = match level {
-        Level::Info => ids.info,
-        Level::Warning => ids.warning,
+        Level::Info => resolved.info,
+        Level::Warning => resolved.warning,
     } as jni::jmethodID;
-    let get_logger = ids.get_logger as jni::jmethodID;
-    let ok = with_attached(|env| {
-        let s = env.new_string_utf(msg)?;
-        let logger = env.call_static_object_method(ids.bukkit.as_jclass(), get_logger, &[]);
-        if logger.is_null() {
+    let get_logger = resolved.get_logger as jni::jmethodID;
+    let bukkit = resolved.bukkit.as_jclass();
+    // (retry_after_failure is returned from the attached closure so the
+    // cache guard is never re-locked inside it — that would self-deadlock.)
+    let outcome: Option<(bool /*served*/, bool /*drop_ids*/)> = with_attached(|env| {
+        // Bukkit.getLogger() NPEs while Bukkit.server is still null (the
+        // kernel-ready trigger fires on class LOAD, long before Paper calls
+        // setServer). A Java exception escaping a native frame here would
+        // kill the caller's thread (or the server tick) — never let it out.
+        let done = (|| -> Option<(bool, bool)> {
+            let s = env.new_string_utf(msg)?;
+            let logger = env.call_static_object_method(bukkit, get_logger, &[]);
+            if env.exception_check() {
+                // Server not assigned yet (or the call failed): clear, drop
+                // the resolved ids so the next emit retries, and let the
+                // stderr fallback handle this message.
+                env.exception_clear();
+                env.delete_local_ref(s);
+                return Some((false, true));
+            }
+            if logger.is_null() {
+                env.delete_local_ref(s);
+                return Some((false, false));
+            }
+            env.call_void_method(logger, mid, &[jni::jvalue { l: s }]);
+            let failed = env.exception_check();
             env.delete_local_ref(s);
-            return None;
-        }
-        env.call_void_method(logger, mid, &[jni::jvalue { l: s }]);
-        env.delete_local_ref(s);
-        env.delete_local_ref(logger);
-        Some(())
+            env.delete_local_ref(logger);
+            if failed {
+                env.exception_clear();
+                return Some((false, false));
+            }
+            Some((true, false))
+        })();
+        done
     })
-    .is_some();
-    if !ok {
+    .flatten();
+    if outcome.map(|(served, drop_ids)| {
+        if drop_ids {
+            *cache = None;
+        }
+        served
+    }) != Some(true)
+    {
         eprintln!("[cplug-sdk] log emit failed: {msg}");
     }
 }

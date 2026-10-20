@@ -1,12 +1,28 @@
 //! The c-LoD engine: a state machine driven from the server main thread.
 //!
-//! Per engine tick (default 1s):
-//!   1. Scan a budgeted batch of atlas cells (JNI getHighestBlockYAt).
-//!   2. For every online player: ensure the resource pack is pushed, then
-//!      add/remove the two post-effect chains based on atlas coverage.
+//! STATIC-PACK lifecycle (v3) — the resource pack is built EXACTLY ONCE per
+//! session and never rebuilt, never re-pushed with new bytes:
 //!
-//! A background thread rebuilds the resource pack when the atlas changed
-//! and swaps it into the HTTP server; the next tick re-pushes the pack.
+//!   Boot → (restore `c-LoD-atlas.bin` if present and matching)
+//!        → Scanning (budgeted JNI heightmap sweeps, main thread)
+//!        → Finalize (sweep complete OR `scan_deadline_secs` reached):
+//!            1. persist the atlas snapshot to disk (if `atlas_cache`)
+//!            2. build the pack from the frozen snapshot
+//!            3. swap it into the embedded HTTP server — done, forever
+//!        → Finalized: zero pack work; the ONLY dynamic part left is
+//!          per-player `/posteffect` tier switching, which touches no bytes.
+//!
+//! Auto-updating LOD without pack rebuilds:
+//!   - Client-side: the `clod:lod_terrain` chain raymarches the world-anchored
+//!     heightfield atlas from the live camera every frame — walking, flying or
+//!     turning re-projects the LOD surface automatically.
+//!   - Server-side: every tick each player is placed in a tier and chains are
+//!     added/removed accordingly:
+//!       * Tier::Off   — other world / no data      → no chains
+//!       * Tier::Veil  — atlas world, outside window → `clod:atmosphere` only
+//!       * Tier::Full  — inside the atlas window     → terrain + atmosphere
+//!   - Across restarts: the restored snapshot reproduces byte-identical pack
+//!     (same SHA-1), so vanilla clients never re-download.
 
 use crate::atlas::Atlas;
 use crate::config::Config;
@@ -15,22 +31,31 @@ use crate::jni::{self, PlayerInfo};
 use crate::packgen::{self, Pack};
 use jvmti_bindings::prelude::JniEnv;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+
+pub const PHASE_BOOT: u8 = 0;
+pub const PHASE_SCANNING: u8 = 1;
+pub const PHASE_PACKING: u8 = 2;
+pub const PHASE_FINALIZED: u8 = 3;
 
 pub struct State {
     pub cfg: Config,
     pub atlas: Arc<Atlas>,
     pub server: Arc<PackServer>,
     pub pack: RwLock<Option<Arc<Pack>>>,
-    /// Set when a new pack was swapped in and clients must re-push.
-    pub repack_pending: AtomicBool,
+    /// Static-pack phase machine (see PHASE_*).
+    pub phase: AtomicU8,
+    /// True when the atlas came from the disk cache (=> finalize immediately
+    /// after the world resolves; bytes must match the previous session).
+    pub restored: bool,
+    /// When the atlas world was first resolved (scan deadline anchor).
+    pub world_seen_at: Mutex<Option<std::time::Instant>>,
     pub scan_seq: AtomicU64,
     pub world_obj: Mutex<usize>, // jobject handle as usize; main-thread only
     pub world_name: Mutex<String>,
     pub keys: Mutex<Option<Keys>>,
     pub per_player: Mutex<HashMap<String, PlayerState>>,
-    pub last_repack: Mutex<std::time::Instant>,
     pub pack_uuid: Mutex<usize>,
 }
 
@@ -42,32 +67,76 @@ pub struct Keys {
 
 #[derive(Default, Clone)]
 pub struct PlayerState {
+    /// SHA-1 of the pack last pushed to this player. The pack is static, so
+    /// after the first successful push this matches forever and we never
+    /// push again — no reloads, no flicker, no re-downloads.
     pub pushed_sha: String,
     pub terrain_on: bool,
     pub atmosphere_on: bool,
 }
 
+/// Per-player LOD tier, re-evaluated every tick. Switching tiers is pure
+/// `/posteffect` add/remove — the pack is never touched.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Tier {
+    /// Other world or no coverage data: no chains applied.
+    Off,
+    /// Atlas world but outside the static window: depth veil only.
+    Veil,
+    /// Inside the static atlas window: terrain + veil.
+    Full,
+}
+
 impl State {
     pub fn new(cfg: Config) -> Arc<Self> {
-        let atlas = Arc::new(Atlas::new(
-            cfg.center_x,
-            cfg.center_z,
-            cfg.atlas_size,
-            cfg.cell_size,
-            cfg.sea_level,
-        ));
+        // Static-pack determinism: restore the frozen snapshot when it
+        // matches the configured geometry; otherwise start an empty atlas.
+        let (atlas, restored) = if cfg.atlas_cache {
+            match Atlas::try_restore(
+                std::path::Path::new(&cfg.atlas_path),
+                cfg.center_x,
+                cfg.center_z,
+                cfg.atlas_size,
+                cfg.cell_size,
+                cfg.sea_level,
+            ) {
+                Some(a) => (Arc::new(a), true),
+                None => (
+                    Arc::new(Atlas::new(
+                        cfg.center_x,
+                        cfg.center_z,
+                        cfg.atlas_size,
+                        cfg.cell_size,
+                        cfg.sea_level,
+                    )),
+                    false,
+                ),
+            }
+        } else {
+            (
+                Arc::new(Atlas::new(
+                    cfg.center_x,
+                    cfg.center_z,
+                    cfg.atlas_size,
+                    cfg.cell_size,
+                    cfg.sea_level,
+                )),
+                false,
+            )
+        };
         let server = PackServer::new();
         Arc::new(Self {
             atlas,
             server,
             pack: RwLock::new(None),
-            repack_pending: AtomicBool::new(false),
+            phase: AtomicU8::new(PHASE_BOOT),
+            restored,
+            world_seen_at: Mutex::new(None),
             scan_seq: AtomicU64::new(0),
             world_obj: Mutex::new(0),
             world_name: Mutex::new(String::new()),
             keys: Mutex::new(None),
             per_player: Mutex::new(HashMap::new()),
-            last_repack: Mutex::new(std::time::Instant::now()),
             pack_uuid: Mutex::new(0),
             cfg,
         })
@@ -75,6 +144,8 @@ impl State {
 }
 
 type Env<'a> = &'a JniEnv;
+
+static BRIDGE_OK: AtomicU8 = AtomicU8::new(0); // 0 pending, 1 ok, 2 failed-once
 
 /// One engine tick. MUST run on the main thread.
 pub fn tick(state: &Arc<State>, env: Env) {
@@ -84,18 +155,21 @@ pub fn tick(state: &Arc<State>, env: Env) {
 }
 
 fn ensure_boot(state: &Arc<State>, env: Env) {
-    // Resolve JNI ids once.
-    if crate::jni_warm_marker()
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_ok()
-    {
-        let ok = jni::warmup(env);
-        crate::log_info(&format!("c-LoD JNI bridge resolved: {ok}"));
-        if !ok {
-            crate::log_info("c-LoD: JNI surface incomplete — is this Paper 26.3+? Module idles.");
-        }
-        // Effect keys (global refs, main thread).
-        if ok {
+    // Resolve JNI ids once the kernel surface is fully loadable. Paper loads
+    // the player-surface classes lazily, so warmup retries each tick until
+    // the whole surface resolves (see jni::warmup).
+    if BRIDGE_OK.load(Ordering::SeqCst) != 1 {
+        if jni::warmup(env) {
+            BRIDGE_OK.store(1, Ordering::SeqCst);
+            crate::log_info("c-LoD JNI bridge resolved: true");
+            // Static-pack phase machine: boot complete -> scanning.
+            let _ = state.phase.compare_exchange(
+                PHASE_BOOT,
+                PHASE_SCANNING,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+            // Effect keys (global refs, main thread).
             let terrain = jni::make_key(env, &state.cfg.effect_terrain)
                 .map(|k| unsafe { new_global(env, k) })
                 .unwrap_or(0);
@@ -111,6 +185,13 @@ fn ensure_boot(state: &Arc<State>, env: Env) {
                 .map(|u| unsafe { new_global(env, u) })
                 .unwrap_or(0);
             *state.pack_uuid.lock().unwrap() = uuid;
+        } else {
+            if BRIDGE_OK.swap(2, Ordering::SeqCst) == 0 {
+                crate::log_info(
+                    "c-LoD JNI surface incomplete — Paper loads kernel classes lazily; retrying each tick",
+                );
+            }
+            return;
         }
     }
 
@@ -124,6 +205,15 @@ fn ensure_boot(state: &Arc<State>, env: Env) {
                 *w = g;
                 *state.world_name.lock().unwrap() = name.clone();
                 crate::log_info(&format!("c-LoD atlas world: {name}"));
+                if state.restored {
+                    crate::log_info(&format!(
+                        "c-LoD atlas restored from {} ({}% coverage) — pack will reproduce the previous session's SHA-1",
+                        state.cfg.atlas_path,
+                        state.atlas.scanned_cells() * 100 / state.atlas.total_cells().max(1)
+                    ));
+                }
+                // Anchor the scan deadline at world resolution.
+                *state.world_seen_at.lock().unwrap() = Some(std::time::Instant::now());
             }
         }
     }
@@ -140,6 +230,10 @@ unsafe fn as_obj(handle: usize) -> jvmti_bindings::jni::jobject {
 }
 
 fn scan_batch(state: &Arc<State>, env: Env) {
+    // Static atlas: after finalize the snapshot is frozen — never scan again.
+    if state.phase.load(Ordering::SeqCst) != PHASE_SCANNING {
+        return;
+    }
     let world_handle = *state.world_obj.lock().unwrap();
     if world_handle == 0 {
         return;
@@ -148,28 +242,29 @@ fn scan_batch(state: &Arc<State>, env: Env) {
     let seq = state.scan_seq.fetch_add(1, Ordering::Relaxed);
     let budget = state.cfg.scan_budget;
     let tasks = state.atlas.scan_task(seq, budget);
-    let mut changed = false;
     for (ix, iz) in tasks {
         let x = state.atlas.cell_world_x(ix);
         let z = state.atlas.cell_world_z(iz);
         if let Some((y, liquid)) = jni::sample_height(env, world, x, z) {
-            let before = state.atlas.version();
             state.atlas.set(ix, iz, (y.clamp(-64, 1023)) as i16, liquid);
-            changed |= state.atlas.version() != before;
         }
     }
-    let _ = changed;
 }
 
-fn coverage(state: &Arc<State>, p: &PlayerInfo) -> bool {
+/// Tier for one player from world + static window bounds.
+fn tier_for(state: &Arc<State>, p: &PlayerInfo) -> Tier {
     if p.world.is_empty() {
-        return false;
+        return Tier::Off;
     }
     let wname = state.world_name.lock().unwrap().clone();
     if !wname.is_empty() && p.world != wname {
-        return false;
+        return Tier::Off;
     }
-    state.atlas.cell_index(p.bx, p.bz).is_some()
+    if state.atlas.cell_index(p.bx, p.bz).is_some() {
+        Tier::Full
+    } else {
+        Tier::Veil
+    }
 }
 
 fn manage_players(state: &Arc<State>, env: Env) {
@@ -179,10 +274,7 @@ fn manage_players(state: &Arc<State>, env: Env) {
         return;
     }
     let pack = state.pack.read().unwrap().clone();
-    let Some(pack) = pack else { return };
-    let repack = state.repack_pending.load(Ordering::Relaxed);
 
-    let url = pack_url(state);
     let players = jni::players(env);
     let mut seen: Vec<String> = Vec::new();
 
@@ -196,48 +288,50 @@ fn manage_players(state: &Arc<State>, env: Env) {
             .or_default()
             .clone();
 
-        // Resource pack (re-)push.
-        let need_push = repack || st.pushed_sha.is_empty() || st.pushed_sha != pack.sha1_hex;
-        if need_push {
-            if let Some(handle) = jni::player_by_uuid(env, &p.uuid) {
-                let pu = *state.pack_uuid.lock().unwrap();
-                if pu != 0 {
-                    let ok = jni::push_pack(
-                        env,
-                        handle,
-                        unsafe { as_obj(pu) },
-                        &url,
-                        &pack.sha1,
-                        &state.cfg.pack_prompt,
-                        false,
-                    );
-                    if ok {
-                        st.pushed_sha = pack.sha1_hex.clone();
+        // 1. Resource pack — pushed exactly once per player per session.
+        //    The pack is static; its SHA-1 never changes, so once pushed we
+        //    never call setResourcePack again (no client reloads, ever).
+        if let Some(pack) = &pack {
+            if st.pushed_sha != pack.sha1_hex {
+                if let Some(handle) = jni::player_by_uuid(env, &p.uuid) {
+                    let pu = *state.pack_uuid.lock().unwrap();
+                    if pu != 0 {
+                        let url = pack_url(state);
+                        let ok = jni::push_pack(
+                            env,
+                            handle,
+                            unsafe { as_obj(pu) },
+                            &url,
+                            &pack.sha1,
+                            &state.cfg.pack_prompt,
+                            false,
+                        );
+                        if ok {
+                            st.pushed_sha = pack.sha1_hex.clone();
+                        }
                     }
                 }
             }
         }
 
-        // Post effects by coverage.
-        let want = coverage(state, &p);
+        // 2. Tier switching — the only dynamic surface, pure /posteffect.
+        let tier = tier_for(state, &p);
+        let have_pack = pack.is_some();
         if let Some(handle) = jni::player_by_uuid(env, &p.uuid) {
-            if want {
-                if keys.terrain != 0 && !st.terrain_on {
-                    st.terrain_on = jni::add_effect(env, handle, unsafe { as_obj(keys.terrain) });
-                }
-                if keys.atmosphere != 0 && !st.atmosphere_on {
-                    st.atmosphere_on =
-                        jni::add_effect(env, handle, unsafe { as_obj(keys.atmosphere) });
-                }
-            } else {
-                if st.terrain_on {
-                    st.terrain_on =
-                        !jni::remove_effect(env, handle, unsafe { as_obj(keys.terrain) });
-                }
-                if st.atmosphere_on {
-                    st.atmosphere_on =
-                        !jni::remove_effect(env, handle, unsafe { as_obj(keys.atmosphere) });
-                }
+            let want_terrain = have_pack && tier == Tier::Full && keys.terrain != 0;
+            let want_atmo =
+                have_pack && (tier == Tier::Full || tier == Tier::Veil) && keys.atmosphere != 0;
+
+            if want_terrain && !st.terrain_on {
+                st.terrain_on = jni::add_effect(env, handle, unsafe { as_obj(keys.terrain) });
+            } else if !want_terrain && st.terrain_on {
+                st.terrain_on = !jni::remove_effect(env, handle, unsafe { as_obj(keys.terrain) });
+            }
+            if want_atmo && !st.atmosphere_on {
+                st.atmosphere_on = jni::add_effect(env, handle, unsafe { as_obj(keys.atmosphere) });
+            } else if !want_atmo && st.atmosphere_on {
+                st.atmosphere_on =
+                    !jni::remove_effect(env, handle, unsafe { as_obj(keys.atmosphere) });
             }
         }
 
@@ -250,10 +344,6 @@ fn manage_players(state: &Arc<State>, env: Env) {
         .lock()
         .unwrap()
         .retain(|k, _| seen.contains(k));
-
-    if repack {
-        state.repack_pending.store(false, Ordering::Relaxed);
-    }
 }
 
 pub fn pack_url(state: &Arc<State>) -> String {
@@ -279,44 +369,71 @@ fn detect_base_url(port: u16) -> String {
     format!("http://{ip}:{port}")
 }
 
-/// Background: rebuild the pack if the atlas changed enough since last time.
-pub fn maybe_rebuild_pack(state: &Arc<State>) {
-    let interval = std::time::Duration::from_secs(state.cfg.refresh_secs.min(60));
+/// Engine-thread finalize driver. Runs `finalize` exactly once when the
+/// static snapshot is complete (restored, swept fully, or deadline reached).
+/// Pure Rust + HTTP swap: no JNI, safe off the main thread.
+pub fn maybe_finalize(state: &Arc<State>) {
+    if state.phase.load(Ordering::SeqCst) != PHASE_SCANNING {
+        return;
+    }
+    // Wait for the atlas world so logs/coverage are coherent before the pack
+    // goes live (one engine tick after world resolution at most).
+    if *state.world_obj.lock().unwrap() == 0 {
+        return;
+    }
+    let complete = state.atlas.scanned_cells() >= state.atlas.total_cells();
+    let deadline_hit = match *state.world_seen_at.lock().unwrap() {
+        Some(t) => t.elapsed().as_secs() >= state.cfg.scan_deadline_secs || state.restored,
+        None => state.restored,
+    };
+    if !complete && !deadline_hit {
+        return;
+    }
+    finalize(state);
+}
+
+/// Build the pack ONCE, swap it into the HTTP server, persist the atlas.
+fn finalize(state: &Arc<State>) {
+    // Exactly-once guarantee even under racy callers.
+    if state
+        .phase
+        .compare_exchange(
+            PHASE_SCANNING,
+            PHASE_PACKING,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        )
+        .is_err()
     {
-        let last = state.last_repack.lock().unwrap();
-        if last.elapsed() < interval {
-            return;
+        return;
+    }
+    let (scanned, total) = (state.atlas.scanned_cells(), state.atlas.total_cells());
+
+    if state.cfg.atlas_cache {
+        let path = std::path::Path::new(&state.cfg.atlas_path);
+        match state.atlas.save(path) {
+            Ok(()) => crate::log_info(&format!(
+                "c-LoD atlas snapshot saved: {} ({} cells, {} bytes)",
+                state.cfg.atlas_path,
+                total,
+                std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+            )),
+            Err(e) => crate::log_info(&format!(
+                "c-LoD atlas snapshot save FAILED ({e}) — restarts will rescan"
+            )),
         }
     }
-    let pack = state.pack.read().unwrap().clone();
-    let atlas_version = state.atlas.version();
-    if let Some(p) = &pack {
-        if p.atlas_version == atlas_version {
-            return;
-        }
-        // First completion also matters: don't publish a 0% atlas.
-        let scanned = state.atlas.scanned_cells();
-        if scanned < state.atlas.total_cells() / 4 && p.atlas_version <= 1 {
-            return;
-        }
-    } else {
-        // Initial pack: wait for a fraction of the atlas.
-        let scanned = state.atlas.scanned_cells();
-        if scanned < state.atlas.total_cells() / 8 {
-            return;
-        }
-    }
-    *state.last_repack.lock().unwrap() = std::time::Instant::now();
+
     let new_pack = packgen::build(&state.cfg, &state.atlas);
     state.server.set_pack(new_pack.zip.clone());
     crate::log_info(&format!(
-        "c-LoD pack rebuilt: atlas v{} -> {} bytes, sha1 {}",
-        new_pack.atlas_version,
+        "c-LoD pack finalized (ONE-TIME, static): {scanned}/{total} cells ({}%), {} bytes, sha1 {}",
+        scanned * 100 / total.max(1),
         new_pack.zip.len(),
         new_pack.sha1_hex
     ));
     *state.pack.write().unwrap() = Some(Arc::new(new_pack));
-    state.repack_pending.store(true, Ordering::Relaxed);
+    state.phase.store(PHASE_FINALIZED, Ordering::SeqCst);
 }
 
 #[cfg(test)]
@@ -342,7 +459,7 @@ mod tests {
             by: 64,
             bz: 100,
         };
-        assert!(coverage(&st, &p));
+        assert_eq!(tier_for(&st, &p), Tier::Full);
         let p_out = PlayerInfo {
             uuid: "u".into(),
             world: "world".into(),
@@ -350,7 +467,7 @@ mod tests {
             by: 64,
             bz: 0,
         };
-        assert!(!coverage(&st, &p_out));
+        assert_eq!(tier_for(&st, &p_out), Tier::Veil);
         let p_world = PlayerInfo {
             uuid: "u".into(),
             world: "world_nether".into(),
@@ -358,6 +475,72 @@ mod tests {
             by: 64,
             bz: 0,
         };
-        assert!(!coverage(&st, &p_world));
+        assert_eq!(tier_for(&st, &p_world), Tier::Off);
+        let p_noworld = PlayerInfo {
+            uuid: "u".into(),
+            world: String::new(),
+            bx: 0,
+            by: 64,
+            bz: 0,
+        };
+        assert_eq!(tier_for(&st, &p_noworld), Tier::Off);
+    }
+
+    #[test]
+    fn finalize_happens_exactly_once() {
+        let dir = std::env::temp_dir().join(format!("clod-eng-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        let st = State::new(Config::parse(&format!(
+            "atlas_size=512;cell_size=8;atlas_cache=true;atlas_path={}/a.bin",
+            dir.display()
+        )));
+        st.phase.store(PHASE_SCANNING, Ordering::SeqCst);
+        *st.world_obj.lock().unwrap() = 1; // pretend the world resolved
+        *st.world_seen_at.lock().unwrap() = Some(std::time::Instant::now());
+        st.atlas.set(0, 0, 70, false);
+
+        // Deadline NOT reached yet, atlas incomplete -> no finalize.
+        maybe_finalize(&st);
+        assert_eq!(st.phase.load(Ordering::SeqCst), PHASE_SCANNING);
+        assert!(st.pack.read().unwrap().is_none());
+
+        // Deadline reached -> finalize; second call is a no-op.
+        *st.world_seen_at.lock().unwrap() =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(10_000));
+        maybe_finalize(&st);
+        assert_eq!(st.phase.load(Ordering::SeqCst), PHASE_FINALIZED);
+        let sha1 = st.pack.read().unwrap().as_ref().unwrap().sha1_hex.clone();
+        maybe_finalize(&st);
+        assert_eq!(st.phase.load(Ordering::SeqCst), PHASE_FINALIZED);
+        assert_eq!(st.pack.read().unwrap().as_ref().unwrap().sha1_hex, sha1);
+
+        // HTTP server serves the finalized pack bytes.
+        let served = st.server.pack_bytes();
+        assert!(!served.is_empty());
+        assert_eq!(
+            served.len(),
+            st.pack.read().unwrap().as_ref().unwrap().zip.len()
+        );
+
+        // Cache file exists and restores to the same SHA-1 (restart sim).
+        let path = dir.join("a.bin");
+        assert!(path.exists());
+        drop(st);
+        let st2 = State::new(Config::parse(&format!(
+            "atlas_size=512;cell_size=8;atlas_cache=true;atlas_path={}/a.bin",
+            dir.display()
+        )));
+        assert!(st2.restored);
+        assert_eq!(st2.atlas.scanned_cells(), 1);
+        st2.phase.store(PHASE_SCANNING, Ordering::SeqCst);
+        *st2.world_obj.lock().unwrap() = 1;
+        *st2.world_seen_at.lock().unwrap() = Some(std::time::Instant::now());
+        maybe_finalize(&st2);
+        assert_eq!(
+            st2.pack.read().unwrap().as_ref().unwrap().sha1_hex,
+            sha1,
+            "restored session must reproduce the exact same pack SHA-1"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

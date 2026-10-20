@@ -23,6 +23,15 @@ impl PackServer {
         }
     }
 
+    /// Snapshot of the currently served pack bytes (empty until finalize).
+    #[allow(dead_code)] // used by tests and diagnostics
+    pub fn pack_bytes(&self) -> Vec<u8> {
+        self.bytes
+            .read()
+            .map(|b| b.as_ref().clone())
+            .unwrap_or_default()
+    }
+
     pub fn serve(self: &Arc<Self>, port: u16) -> std::io::Result<()> {
         let listener = TcpListener::bind(("0.0.0.0", port))?;
         crate::log_info(&format!(

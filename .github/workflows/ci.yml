@@ -121,9 +121,107 @@ jobs:
           path: dist/*.tar.gz
           if-no-files-found: error
 
+  e2e-live:
+    name: e2e live server (Paper 26.3 + CRUSSTY + static-pack gates)
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+      - name: Build module (release)
+        run: cargo build --release
+      - name: Build CRUSSTY runtime + launcher
+        run: |
+          git clone --depth 1 https://github.com/PLANETA9091/CRUSSTY.git crussty
+          cargo build --release --manifest-path crussty/runtime/Cargo.toml
+          mkdir -p crussty/launcher/out
+          javac -d crussty/launcher/out crussty/launcher/src/main/java/dev/dist/launcher/Main.java
+          jar cfe crussty/launcher/launcher.jar dev.dist.launcher.Main -C crussty/launcher/out .
+      - name: Fetch Paper 26.3
+        run: |
+          URL=$(curl -s https://fill.papermc.io/v3/projects/paper/versions/26.3/builds/latest \
+            | python3 -c "import json,sys;print(json.load(sys.stdin)['downloads']['server:default']['url'])")
+          curl -sL -o paper.jar "$URL"
+          mkdir -p dist/versions
+          cp paper.jar dist/versions/paper-26.3.jar
+      - name: Assemble dist root
+        run: |
+          mkdir -p dist/modules/lod
+          cp target/release/liblod.so dist/modules/lod/
+          cp module.json dist/modules/lod/
+          cp crussty/launcher/launcher.jar dist/
+          cp crussty/runtime/target/release/libcrussty_runtime.so dist/
+          printf 'eula=true\n' > dist/eula.txt
+          {
+            echo 'online-mode=false'
+            echo 'view-distance=6'
+            echo 'simulation-distance=6'
+            echo 'server-port=25565'
+            echo 'motd=c-LoD CI'
+          } > dist/server.properties
+      - name: Boot #1 (fresh world, fast static-pack config)
+        working-directory: dist
+        env:
+          CLOD_OPTS: "scan_deadline_secs=25;tick_ms=200;atlas_size=1024;cell_size=4;http_port=8199"
+        run: |
+          java -Xmx2G -jar launcher.jar > boot1.log 2>&1 &
+          SRV=$!
+          for i in $(seq 1 180); do
+            grep -q "pack finalized (ONE-TIME, static)" boot1.log && break
+            sleep 2
+          done
+          grep "pack finalized (ONE-TIME, static)" boot1.log || { tail -80 boot1.log; kill -9 $SRV 2>/dev/null; exit 1; }
+          kill $SRV 2>/dev/null; sleep 3; pkill -9 -f "launcher.jar" 2>/dev/null; sleep 2; true
+      - name: Verify boot #1 (gates + HTTP + cache)
+        working-directory: dist
+        run: |
+          python3 ../scripts/e2e/gates.py boot1.log
+          curl -s -o pack1.zip -w "HTTP %{http_code}\n" http://127.0.0.1:8199/clod-pack.zip
+          SIZE=$(stat -c%s pack1.zip); test "$SIZE" -gt 1024 || { echo "pack too small: $SIZE"; exit 1; }
+          test ! -e c-LoD-atlas.bin.tmp || { echo "stale tmp snapshot"; exit 1; }
+          test -f c-LoD-atlas.bin || { echo "atlas cache missing"; exit 1; }
+      - name: Boot #2 (restart — atlas cache must reproduce the SAME sha1)
+        working-directory: dist
+        env:
+          CLOD_OPTS: "scan_deadline_secs=25;tick_ms=200;atlas_size=1024;cell_size=4;http_port=8199"
+        run: |
+          java -Xmx2G -jar launcher.jar > boot2.log 2>&1 &
+          SRV=$!
+          for i in $(seq 1 180); do
+            grep -q "pack finalized (ONE-TIME, static)" boot2.log && break
+            sleep 2
+          done
+          grep "pack finalized (ONE-TIME, static)" boot2.log || { tail -80 boot2.log; kill -9 $SRV 2>/dev/null; exit 1; }
+          grep -q "atlas restored" boot2.log || { echo "atlas cache was not restored"; tail -80 boot2.log; exit 1; }
+          kill $SRV 2>/dev/null; sleep 3; pkill -9 -f "launcher.jar" 2>/dev/null; sleep 2; true
+      - name: Static-pack SHA-1 stability across restarts
+        working-directory: dist
+        run: |
+          S1=$(grep -o 'sha1 [0-9a-f]\{40\}' boot1.log | head -1 | cut -d' ' -f2)
+          S2=$(grep -o 'sha1 [0-9a-f]\{40\}' boot2.log | head -1 | cut -d' ' -f2)
+          echo "boot1 sha1: $S1"; echo "boot2 sha1: $S2"
+          test -n "$S1" && test -n "$S2"
+          test "$S1" = "$S2" || { echo "FAIL: restart changed the pack sha1 — clients would re-download"; exit 1; }
+          python3 ../scripts/e2e/gates.py boot2.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-logs
+          path: |
+            dist/boot1.log
+            dist/boot2.log
+            dist/logs/server.log
+
   strict:
     name: strictness gate (all green)
-    needs: [fmt, clippy, test, glsl, build, packaging]
+    needs: [fmt, clippy, test, glsl, build, packaging, e2e-live]
+    if: always() && (needs.e2e-live.result == 'success' || needs.e2e-live.result == 'skipped')
     runs-on: ubuntu-latest
     steps:
       - name: Everything passed

@@ -1,5 +1,6 @@
 #version 330
 #extension GL_ARB_separate_shader_objects : require
+#include <minecraft:globals.glsl>
 
 // c-LoD atmosphere: a distance veil over real terrain that hides the
 // render-distance edge. Pure depth-driven (no view rotation needed), so it
@@ -8,6 +9,8 @@
 // Depth thresholds are uniforms rather than reconstructed distances: the
 // device->eye mapping differs between renderpearl backends, and a monotonic
 // smoothstep over device depth is backend-independent and fully tunable.
+// The veil color tracks the day cycle through GameTime (post chains receive
+// Globals but no Fog UBO — verified against the 26.3 client sources).
 
 uniform sampler2D In;      // minecraft:main color
 uniform sampler2D InDepth; // minecraft:main depth
@@ -41,6 +44,13 @@ void main() {
         return;
     }
 
+    // Day-graded veil: bright and neutral by day, darker moonlit blue at
+    // night, so the edge never glows against a dark sky.
+    float sunY = sin(fract(GameTime) * 6.28318530718);
+    float dayF = smoothstep(-0.14, 0.22, sunY);
+    vec3 veilCol = VeilColor.rgb * mix(0.42, 1.0, dayF);
+    veilCol = mix(veilCol * vec3(0.85, 0.9, 1.12), veilCol, dayF);
+
     float veil = smoothstep(AtmoParams.x, AtmoParams.y, depth) * AtmoParams.z;
-    fragColor = vec4(mix(scene.rgb, VeilColor.rgb, clamp(veil, 0.0, 1.0)), scene.a);
+    fragColor = vec4(mix(scene.rgb, veilCol, clamp(veil, 0.0, 1.0)), scene.a);
 }

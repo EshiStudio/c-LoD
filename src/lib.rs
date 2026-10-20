@@ -2,17 +2,22 @@
 //!
 //! Architecture (NO Display entities, NO client mods):
 //!   1. The module scans world heightmaps into a texture atlas (JNI, main
-//!      thread, budgeted per tick).
+//!      thread, budgeted per tick) until the sweep completes or the scan
+//!      deadline fires. The atlas is frozen and (by default) persisted.
 //!   2. It generates a server resource pack containing two `/posteffect`
 //!      chains + GLSL shaders + the atlas PNG, and serves it over an
-//!      embedded HTTP server.
-//!   3. Players receive the pack (`setResourcePack`) and the module applies
-//!      the chains per player (`PlayerPostEffects.add(Key)`).
+//!      embedded HTTP server. The pack is built EXACTLY ONCE per session —
+//!      never rebuilt, never re-pushed with new bytes (no client reloads).
+//!   3. Players receive the pack once (`setResourcePack`, stable SHA-1);
+//!      across restarts the restored snapshot reproduces the same bytes.
 //!   4. On the client, `clod:lod_terrain` recovers the view rotation from
 //!      the vanilla sun/moon position (GameTime is a free data channel),
-//!      raymarches the heightfield atlas over sky pixels and paints distant
-//!      terrain. `clod:atmosphere` hides the render-distance edge with a
-//!      depth veil — rotation-free, works from the first frame.
+//!      raymarches the world-anchored heightfield atlas from the live
+//!      camera every frame and paints distant terrain — LOD auto-updates
+//!      as players move, with zero server-side pack work.
+//!   5. `clod:atmosphere` hides the render-distance edge with a depth veil.
+//!      Per tick the engine switches chains per player (Off / Veil / Full
+//!      tiers) — the only dynamic part, pure `/posteffect`.
 
 mod atlas;
 mod config;
@@ -25,14 +30,7 @@ mod sha1;
 mod zipw;
 
 use cplug_abi::{CPluginApi, JavaVmPtr};
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-
-static JNI_WARM: AtomicBool = AtomicBool::new(false);
-
-pub(crate) fn jni_warm_marker() -> &'static AtomicBool {
-    &JNI_WARM
-}
 
 pub(crate) fn log_info(msg: &str) {
     eprintln!("[c-LoD] {msg}");
@@ -59,11 +57,28 @@ pub unsafe extern "C" fn cplugin_init(
     cplug_sdk::init(api, vm);
 
     let opts = cplug_sdk::jni_util::cstr(options).unwrap_or("").to_string();
+    // CI/ops escape hatch: the CRUSSTY launcher hardcodes the agent options
+    // string, so extra module knobs ride in via CLOD_OPTS ("k=v;k2=v2")
+    // appended after the runtime's own keys (unknown keys are ignored by the
+    // runtime's parser, ours are parsed below).
+    let opts = match std::env::var("CLOD_OPTS") {
+        Ok(extra) if !extra.trim().is_empty() => format!("{opts};{}", extra.trim()),
+        _ => opts,
+    };
     let cfg = config::Config::parse(&opts);
     log_info(&format!(
-        "booting: atlas {}x{} blocks (cell {}), http :{}, fov {}",
-        cfg.atlas_size, cfg.atlas_size, cfg.cell_size, cfg.http_port, cfg.fov
+        "booting: atlas {}x{} blocks (cell {}), http :{}, fov {}, static pack (scan deadline {}s, cache {})",
+        cfg.atlas_size,
+        cfg.atlas_size,
+        cfg.cell_size,
+        cfg.http_port,
+        cfg.fov,
+        cfg.scan_deadline_secs,
+        if cfg.atlas_cache { "on" } else { "off" }
     ));
+    log_info(
+        "c-LoD v3.0: static pack mode — one finalize per session, zero rebuilds, zero re-pushes",
+    );
 
     let st = engine::State::new(cfg);
     let _ = STATE.set(Arc::clone(&st));
@@ -87,26 +102,21 @@ pub unsafe extern "C" fn cplugin_init(
         log_info("kernel ready — starting engine loop");
         let st = state().expect("state").clone();
         let tick_ms = st.cfg.tick_ms;
-        let repack_period = st.cfg.refresh_secs;
 
         std::thread::Builder::new()
             .name("clod-engine".into())
-            .spawn(move || {
-                let mut last_repack_check = std::time::Instant::now();
-                loop {
-                    std::thread::sleep(std::time::Duration::from_millis(tick_ms));
-                    let st = state().expect("state").clone();
-                    if last_repack_check.elapsed().as_secs() >= repack_period.min(60) {
-                        engine::maybe_rebuild_pack(&st);
-                        last_repack_check = std::time::Instant::now();
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_millis(tick_ms));
+                let st = state().expect("state").clone();
+                // Static pack: the one-time finalize runs here (pure Rust +
+                // HTTP swap, no JNI). After it, this call is a cheap no-op.
+                engine::maybe_finalize(&st);
+                cplug_sdk::run_on_main_thread({
+                    let st = Arc::clone(&st);
+                    move |_env| {
+                        engine::tick(&st, _env);
                     }
-                    cplug_sdk::run_on_main_thread({
-                        let st = Arc::clone(&st);
-                        move |_env| {
-                            engine::tick(&st, _env);
-                        }
-                    });
-                }
+                });
             })
             .ok();
     });

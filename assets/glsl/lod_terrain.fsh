@@ -203,10 +203,17 @@ void main() {
 
     float tt = fract(GameTime) * 6.28318530718;
     vec3 sunDir = vec3(cos(tt), sin(tt), 0.0);
+    // RAW sun elevation drives the day cycle (shader-pack practice: distant
+    // detail must dissolve into a color that tracks the sky, not a constant).
+    // Post chains get no Fog UBO (verified in 26.3 sources: no vanilla post
+    // shader binds one), so GameTime is the only live sky data available.
+    float sunY = sin(tt);
+    float dayF = smoothstep(-0.14, 0.22, sunY);
+    vec3 veilCol = VeilColor.rgb * mix(0.42, 1.0, dayF);
+    veilCol = mix(veilCol * vec3(0.85, 0.9, 1.12), veilCol, dayF); // moonlit blue at night
     if (sunDir.y < -0.12) {
         sunDir = -sunDir;
     }
-    float dayness = clamp(sunDir.y * 3.0 + 0.5, 0.05, 1.0);
 
     float hn = clamp((hitPos.y - sea) / max(maxY - sea, 1.0), 0.0, 1.0);
     vec3 terrainCol = mix(ColLow.rgb, ColHigh.rgb, smoothstep(0.15, 0.9, hn));
@@ -218,12 +225,13 @@ void main() {
 
     vec3 lightDir = normalize(vec3(sunDir.x, max(sunDir.y, 0.15), 0.0));
     float diff = max(dot(n, lightDir), 0.0);
-    float ambient = 0.35 + 0.25 * dayness;
-    vec3 lit = albedo * (ambient + diff * (0.45 + 0.35 * dayness));
+    float ambient = mix(0.20, 0.55, dayF);
+    float sunGain = mix(0.30, 0.80, dayF);
+    vec3 lit = albedo * (ambient + diff * sunGain);
 
-    // Distance fog into the veil color: merges LOD into the sky.
+    // Distance fog into the day-graded veil color: merges LOD into the sky.
     float fog = smoothstep(FogParams.x, FogParams.y, tHit);
-    lit = mix(lit, VeilColor.rgb, fog);
+    lit = mix(lit, veilCol, fog);
 
     fragColor = vec4(mix(scene.rgb, lit, fade), scene.a);
 }
