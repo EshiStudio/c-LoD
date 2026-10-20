@@ -118,7 +118,7 @@ struct WorldIds {
     m_highest_block: jmethodID,
     m_get_block_at: jmethodID,
     m_chunk_loaded: jmethodID,
-    m_get_chunk: jmethodID,
+    m_set_force_loaded: jmethodID,
 }
 // Raw method-ID pointers cached process-lifetime; consumed main-thread-only.
 unsafe impl Send for WorldIds {}
@@ -193,7 +193,7 @@ fn world_ids(env: Env, world: jobject) -> Option<WorldIds> {
         m_name: bind_method(env, cls_local, cls, "getName", "()Ljava/lang/String;")?,
         m_highest_block: bind_method(env, cls_local, cls, "getHighestBlockYAt", "(II)I")?,
         m_chunk_loaded: bind_method(env, cls_local, cls, "isChunkLoaded", "(II)Z")?,
-        m_get_chunk: bind_method(env, cls_local, cls, "getChunkAt", "(II)Lorg/bukkit/Chunk;")?,
+        m_set_force_loaded: bind_method(env, cls_local, cls, "setChunkForceLoaded", "(IIZ)V")?,
         m_get_block_at: bind_method(
             env,
             cls_local,
@@ -620,24 +620,65 @@ pub fn find_world(env: Env, name: &str) -> Option<WorldRef> {
     None
 }
 
-/// Force-load (and, if needed, generate) one chunk. Used once at boot to
-/// warm the core region for the static snapshot.
-pub fn warm_chunk(env: Env, world: jobject, cx: i32, cz: i32) -> bool {
+/// Force-load one chunk (vanilla /forceload semantics: load + generate +
+/// RETAIN until un-forced). Paper unloads freshly generated chunks within
+/// seconds when no players are near, so plain getChunkAt warm-up evaporates
+/// before the sweep reaches the cells.
+pub fn warm_chunk(env: Env, world: jobject, cx: i32, cz: i32, retain: bool) -> bool {
     let Some(wid) = world_ids(env, world) else {
         clear_if_pending(env);
         return false;
     };
-    let _ = env.call_object_method(world, wid.m_get_chunk, &[ji(cx), ji(cz)]);
+    if retain {
+        env.call_void_method(world, wid.m_set_force_loaded, &[ji(cx), ji(cz), jz(true)]);
+        let ok = !env.exception_check();
+        clear_if_pending(env);
+        return ok;
+    }
+    // Release pass: un-force (the engine calls this at finalize).
+    env.call_void_method(world, wid.m_set_force_loaded, &[ji(cx), ji(cz), jz(false)]);
     let ok = !env.exception_check();
     clear_if_pending(env);
     ok
 }
 
+/// Diagnostic: direct isChunkLoaded probe.
+#[allow(dead_code)]
+pub fn is_chunk_loaded(env: Env, world: jobject, cx: i32, cz: i32) -> Option<bool> {
+    let wid = world_ids(env, world)?;
+    let v = env.call_boolean_method(world, wid.m_chunk_loaded, &[ji(cx), ji(cz)]);
+    let pending = env.exception_check();
+    clear_if_pending(env);
+    if pending {
+        return None;
+    }
+    Some(v)
+}
+
+/// Diagnostic: direct getHighestBlockYAt probe.
+#[allow(dead_code)]
+pub fn probe_height(env: Env, world: jobject, x: i32, z: i32) -> Option<i32> {
+    let wid = world_ids(env, world)?;
+    let y = env.call_int_method(world, wid.m_highest_block, &[ji(x), ji(z)]);
+    let pending = env.exception_check();
+    clear_if_pending(env);
+    if pending {
+        return None;
+    }
+    Some(y)
+}
+
 /// Sample the surface height at one column. Returns (blockY, isLiquid).
+pub static SCAN_OK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SCAN_UNLOADED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SCAN_ERR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub fn sample_height(env: Env, world: jobject, x: i32, z: i32) -> Option<(i32, bool)> {
+    use std::sync::atomic::Ordering;
     let wid = world_ids(env, world)?;
     if env.exception_check() {
         env.exception_clear();
+        SCAN_ERR.fetch_add(1, Ordering::Relaxed);
         return None;
     }
     // Only sample loaded chunks: getHighestBlockYAt would otherwise force
@@ -650,11 +691,13 @@ pub fn sample_height(env: Env, world: jobject, x: i32, z: i32) -> Option<(i32, b
         return None;
     }
     if !loaded {
+        SCAN_UNLOADED.fetch_add(1, Ordering::Relaxed);
         return None;
     }
     let y = env.call_int_method(world, wid.m_highest_block, &[ji(x), ji(z)]);
     if env.exception_check() {
         env.exception_clear();
+        SCAN_ERR.fetch_add(1, Ordering::Relaxed);
         return None;
     }
     if y < -64 {
@@ -672,6 +715,7 @@ pub fn sample_height(env: Env, world: jobject, x: i32, z: i32) -> Option<(i32, b
     };
     let liquid = env.call_boolean_method(block, bid.m_is_liquid, &[]);
     clear_if_pending(env);
+    SCAN_OK.fetch_add(1, Ordering::Relaxed);
     Some((y, liquid))
 }
 

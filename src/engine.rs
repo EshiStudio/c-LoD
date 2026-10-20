@@ -154,7 +154,43 @@ static BRIDGE_OK: AtomicU8 = AtomicU8::new(0); // 0 pending, 1 ok, 2 failed-once
 pub fn tick(state: &Arc<State>, env: Env) {
     ensure_boot(state, env);
     scan_batch(state, env);
+    release_forceload(state, env);
     manage_players(state, env);
+}
+
+/// One-time: after finalize, release the temporary force-load on the warm
+/// core (the snapshot is taken; a static pack needs no live chunks). Runs on
+/// the main thread because it touches JNI; CAS makes it exactly-once.
+fn release_forceload(state: &Arc<State>, env: Env) {
+    if state.warmed.load(Ordering::SeqCst) != 1
+        || state.phase.load(Ordering::SeqCst) != PHASE_FINALIZED
+    {
+        return;
+    }
+    if state
+        .warmed
+        .compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    let world_handle = *state.world_obj.lock().unwrap();
+    if world_handle == 0 {
+        return;
+    }
+    let world = unsafe { as_obj(world_handle) };
+    let w = state.cfg.warm_chunks;
+    let mut released = 0usize;
+    for cx in -w..=w {
+        for cz in -w..=w {
+            if jni::warm_chunk(env, world, cx, cz, false) {
+                released += 1;
+            }
+        }
+    }
+    crate::log_info(&format!(
+        "c-LoD core force-load released ({released} chunks) — static snapshot retained"
+    ));
 }
 
 fn ensure_boot(state: &Arc<State>, env: Env) {
@@ -225,14 +261,16 @@ fn ensure_boot(state: &Arc<State>, env: Env) {
                     let mut loaded = 0usize;
                     for cx in -w..=w {
                         for cz in -w..=w {
-                            if jni::warm_chunk(env, unsafe { as_obj(g) }, cx, cz) {
+                            if jni::warm_chunk(env, unsafe { as_obj(g) }, cx, cz, true) {
                                 loaded += 1;
                             }
                         }
                     }
                     state.warmed.store(1, Ordering::SeqCst);
+                    let loaded0 = jni::is_chunk_loaded(env, unsafe { as_obj(g) }, 0, 0);
+                    let h0 = jni::probe_height(env, unsafe { as_obj(g) }, 0, 0);
                     crate::log_info(&format!(
-                        "c-LoD core warmed: {}x{} chunks around atlas center ({} loaded)",
+                        "c-LoD core force-loaded: {}x{} chunks around atlas center ({} ok) — isChunkLoaded(0,0)={loaded0:?}, height(0,0)={h0:?} — released at finalize",
                         2 * w + 1,
                         2 * w + 1,
                         loaded
@@ -265,13 +303,30 @@ fn scan_batch(state: &Arc<State>, env: Env) {
     let world = unsafe { as_obj(world_handle) };
     let seq = state.scan_seq.fetch_add(1, Ordering::Relaxed);
     let budget = state.cfg.scan_budget;
-    let tasks = state.atlas.scan_task(seq, budget);
-    for (ix, iz) in tasks {
+    // Advance the sweep by `budget` cells per tick (scan_task wraps the
+    // start index over the whole atlas): passing the bare tick number made
+    // every tick rescan cells 0..budget+bumped-by-one, leaving most of the
+    // atlas (and the warm core) unreached until the deadline fired.
+    let tasks = state.atlas.scan_task(seq * budget as u64, budget);
+    for (ix, iz) in tasks.iter().copied() {
         let x = state.atlas.cell_world_x(ix);
         let z = state.atlas.cell_world_z(iz);
         if let Some((y, liquid)) = jni::sample_height(env, world, x, z) {
             state.atlas.set(ix, iz, (y.clamp(-64, 1023)) as i16, liquid);
         }
+    }
+    // Rate-limited scan diagnostics (one line per 25 ticks).
+    if seq.is_multiple_of(25) {
+        use std::sync::atomic::Ordering as O;
+        crate::log_info(&format!(
+            "scan: tick {seq}, atlas v{} ({}/{} cells), ok={} unloaded={} err={}",
+            state.atlas.version(),
+            state.atlas.scanned_cells(),
+            state.atlas.total_cells(),
+            jni::SCAN_OK.load(O::Relaxed),
+            jni::SCAN_UNLOADED.load(O::Relaxed),
+            jni::SCAN_ERR.load(O::Relaxed),
+        ));
     }
 }
 
