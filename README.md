@@ -78,18 +78,27 @@ Options string passed through the CRUSSTY runtime (`key=value;key=value`):
 | `snow_line` | `0.78` | Snow blend point (normalized elevation) |
 | `sun_threshold` / `rot_blend` | `0.18` / `0.35` | Sun-tracker gates |
 | `max_height` | `320` | Terrain ceiling used for ray culling |
+| `atmo_tiers` | `3` | Veil tiers emitted into the pack (1–8); tier 0 weakest, tier N-1 strongest |
+| `adaptive` | `true` | Pick the veil tier per player from height above terrain |
+| `recenter_blocks` | `1024` | Re-aim the atlas window when all players drift this far outside it (0 = off) |
+| `recenter_patience` | `20` | Consecutive adaptive ticks before the window moves |
 
-Post-effect ids installed by the pack: **`clod:lod_terrain`**, **`clod:atmosphere`** — exactly the identifiers the vanilla `/posteffect` command accepts, so admins can also toggle them by hand:
+Post-effect ids installed by the pack: **`clod:lod_terrain`** and **`clod:atmosphere_t0..t<N-1>`** — exactly the identifiers the vanilla `/posteffect` command accepts, so admins can also toggle them by hand:
 
 ```
 /posteffect add @a clod:lod_terrain
+/posteffect add @a clod:atmosphere_t2
 ```
+
+### Adaptive LOD (v2.1)
+
+The atmosphere veil ships in `atmo_tiers` intensity tiers. Every engine tick the module computes each player's height above the scanned terrain: stay near the ground and the strongest tier masks the render-distance edge; climb a tower or mountain and the veil automatically weakens tier by tier, sharpening the horizon and revealing more of the raymarched LOD terrain. Tier switches happen only on actual changes — no add/remove spam. When every player drifts `recenter_blocks` outside the atlas window, the window follows them (atlas rescan, pack rebuild, clients re-download by SHA-1).
 
 ## Development
 
 ```bash
 bash build.sh                 # cargo build --release -> liblod.so
-cargo test                    # 23 unit tests (zip/png/sha1/atlas/packgen/config)
+cargo test                    # 32 unit tests (zip/png/sha1/atlas/packgen/config/tiers)
 bash scripts/check_glsl.sh    # glslangValidator over all shaders + chain JSONs
 ```
 
@@ -101,6 +110,7 @@ CI runs rustfmt, clippy (`-D warnings`), the full test suite, glslang shader val
 - **Rotation acquisition needs the sun or moon on screen.** Indoors/caves the tracker holds its last estimate (with decay) and the atmosphere chain keeps working — it never needs rotation.
 - The sun tracker may briefly blend into bright warm clouds at sunset; temporal blending and confidence gating keep the LOD stable.
 - Atlas generation forces chunk loads — keep `scan_budget` reasonable for your tick budget.
+- Adaptive tiering uses the scanned surface height under each player; freshly recentered areas fall back to sea level until rescanned.
 
 ## License
 

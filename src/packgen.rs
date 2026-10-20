@@ -14,6 +14,9 @@ pub struct Pack {
     pub sha1: [u8; 20],
     pub sha1_hex: String,
     pub atlas_version: u64,
+    /// Post-effect ids emitted for this pack, weakest-veil tier first
+    /// (`clod:atmosphere_t0..`), so the engine can bind Keys per tier.
+    pub atmosphere_ids: Vec<String>,
 }
 
 fn fmt_f(v: f32) -> String {
@@ -59,12 +62,8 @@ pub fn build(cfg: &Config, atlas: &Atlas) -> Pack {
     let lod_terrain_tpl = include_str!("../assets/post_effect/lod_terrain.json");
     let atmosphere_tpl = include_str!("../assets/post_effect/atmosphere.json");
 
-    let origin_x = atlas.center_x - atlas.half();
-    let origin_z = atlas.center_z - atlas.half();
-    // Device-depth veil window: tuned so the last ~15% of real geometry
-    // before the far plane melts into the veil color.
-    let atmo_start = fmt_f(0.9990);
-    let atmo_end = fmt_f(0.99975);
+    let origin_x = atlas.center_x() - atlas.half();
+    let origin_z = atlas.center_z() - atlas.half();
     let fog_start = cfg.lod_near * 1.05;
     let fog_end = atlas.size as f32 * 0.72;
 
@@ -75,7 +74,7 @@ pub fn build(cfg: &Config, atlas: &Atlas) -> Pack {
         cfg.snow_line,
     ];
 
-    let map: Vec<(&str, String)> = vec![
+    let mut map: Vec<(&str, String)> = vec![
         ("__FOV__", fmt_f(cfg.fov)),
         ("__SCAN_THRESH__", fmt_f(cfg.sun_threshold)),
         ("__ROT_BLEND__", fmt_f(cfg.rot_blend)),
@@ -95,13 +94,47 @@ pub fn build(cfg: &Config, atlas: &Atlas) -> Pack {
         ("__COL_HIGH__", vec3(cfg.color_high)),
         ("__COL_WATER__", vec3(cfg.color_water)),
         ("__VEIL_RGBA__", vec4(veil_rgba)),
-        ("__ATMO_START__", atmo_start),
-        ("__ATMO_END__", atmo_end),
-        ("__ATMO_STRENGTH__", fmt_f(0.92)),
     ];
 
     let lod_terrain_json = substitute(lod_terrain_tpl, &map);
-    let atmosphere_json = substitute(atmosphere_tpl, &map);
+
+    // Atmosphere veil tiers: tier 0 = weakest (seen from high above the
+    // terrain — the horizon stays crisp), tier N-1 = strongest (ground
+    // level — full render-distance edge masking). Depth windows are kept
+    // inside the device-depth band where real geometry lives.
+    let n = cfg.atmo_tiers.max(1);
+    let max_t = n - 1;
+    let base_name = cfg
+        .effect_atmosphere
+        .rsplit_once(':')
+        .map(|(_, s)| s.to_string())
+        .unwrap_or_else(|| "atmosphere".to_string());
+    let mut atmosphere_ids = Vec::with_capacity(n as usize);
+    let mut atmosphere_entries: Vec<(String, String)> = Vec::with_capacity(n as usize);
+    for t in 0..n {
+        let frac = if max_t == 0 {
+            1.0
+        } else {
+            t as f32 / max_t as f32
+        };
+        let lerp = |a: f32, b: f32, f: f32| a + (b - a) * f;
+        let start = lerp(0.99940, 0.99900, frac);
+        let end = lerp(0.99985, 0.99975, frac);
+        let strength = lerp(0.55, 0.92, frac);
+        map.retain(|(k, _)| {
+            *k != "__ATMO_START__" && *k != "__ATMO_END__" && *k != "__ATMO_STRENGTH__"
+        });
+        map.push(("__ATMO_START__", fmt_f(start)));
+        map.push(("__ATMO_END__", fmt_f(end)));
+        map.push(("__ATMO_STRENGTH__", fmt_f(strength)));
+        let json = substitute(atmosphere_tpl, &map);
+        let id = format!("{}_t{t}", cfg.effect_atmosphere);
+        atmosphere_ids.push(id);
+        atmosphere_entries.push((
+            format!("assets/clod/post_effect/{base_name}_t{t}.json"),
+            json,
+        ));
+    }
 
     let sun_scan = include_str!("../assets/glsl/sun_scan.fsh");
     let sun_reduce = include_str!("../assets/glsl/sun_reduce.fsh");
@@ -124,10 +157,9 @@ pub fn build(cfg: &Config, atlas: &Atlas) -> Pack {
         "assets/clod/post_effect/lod_terrain.json",
         lod_terrain_json.as_bytes(),
     );
-    zip.add(
-        "assets/clod/post_effect/atmosphere.json",
-        atmosphere_json.as_bytes(),
-    );
+    for (path, json) in &atmosphere_entries {
+        zip.add(path, json.as_bytes());
+    }
     zip.add("assets/clod/shaders/post/sun_scan.fsh", sun_scan.as_bytes());
     zip.add(
         "assets/clod/shaders/post/sun_reduce.fsh",
@@ -163,6 +195,7 @@ pub fn build(cfg: &Config, atlas: &Atlas) -> Pack {
         sha1,
         sha1_hex,
         atlas_version,
+        atmosphere_ids,
     }
 }
 
@@ -194,12 +227,33 @@ mod tests {
 
         // Must contain the essential entries: scan by walking central dir.
         let count = u16::from_le_bytes([pack.zip[n - 12], pack.zip[n - 11]]) as usize;
-        assert_eq!(count, 11, "pack.mcmeta + 2 json + 7 fsh + atlas.png");
+        // pack.mcmeta + lod_terrain.json + N atmosphere tiers + 7 fsh + atlas.png
+        assert_eq!(count, 2 + cfg.atmo_tiers as usize + 7 + 1);
+        assert_eq!(pack.atmosphere_ids.len(), cfg.atmo_tiers as usize);
+        assert_eq!(pack.atmosphere_ids[0], "clod:atmosphere_t0");
+        assert_eq!(
+            pack.atmosphere_ids[cfg.atmo_tiers as usize - 1],
+            format!("clod:atmosphere_t{}", cfg.atmo_tiers - 1)
+        );
 
         // JSON chains are valid JSON (parenthesis balance + token-free).
         let s = String::from_utf8_lossy(pack.zip.as_slice());
         assert!(!s.contains("__FOV__"), "tokens must be substituted");
         let _ = zipw::crc32(pack.zip.as_slice());
+    }
+
+    #[test]
+    fn tier_uniforms_scale() {
+        let cfg = Config::parse("atmo_tiers=4");
+        let atlas = Atlas::new(0, 0, 64, 4, 63);
+        atlas.set(1, 1, 80, false);
+        let pack = build(&cfg, &atlas);
+        assert_eq!(pack.atmosphere_ids.len(), 4);
+        // Tier 0 (weakest): strength 0.55, start 0.9994.
+        // Tier 3 (strongest): strength 0.92, start 0.999.
+        let s = String::from_utf8_lossy(&pack.zip);
+        assert!(s.contains("0.55"), "weakest tier strength");
+        assert!(s.contains("0.92"), "strongest tier strength");
     }
 
     #[test]

@@ -9,13 +9,13 @@
 //! and swaps it into the HTTP server; the next tick re-pushes the pack.
 
 use crate::atlas::Atlas;
-use crate::config::Config;
+use crate::config::{self, Config};
 use crate::http::PackServer;
 use crate::jni::{self, PlayerInfo};
 use crate::packgen::{self, Pack};
 use jvmti_bindings::prelude::JniEnv;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 pub struct State {
@@ -32,19 +32,23 @@ pub struct State {
     pub per_player: Mutex<HashMap<String, PlayerState>>,
     pub last_repack: Mutex<std::time::Instant>,
     pub pack_uuid: Mutex<usize>,
+    /// Consecutive adaptive ticks with every player outside the window.
+    pub recenter_streak: AtomicU32,
 }
 
 #[derive(Clone)]
 pub struct Keys {
     pub terrain: usize, // jobject global refs (main-thread only)
-    pub atmosphere: usize,
+    /// Atmosphere veil tier keys, weakest tier first (index = tier).
+    pub atmo: Vec<usize>,
 }
 
 #[derive(Default, Clone)]
 pub struct PlayerState {
     pub pushed_sha: String,
     pub terrain_on: bool,
-    pub atmosphere_on: bool,
+    /// Currently applied veil tier; None = none applied.
+    pub atmo_tier: Option<u32>,
 }
 
 impl State {
@@ -69,6 +73,7 @@ impl State {
             per_player: Mutex::new(HashMap::new()),
             last_repack: Mutex::new(std::time::Instant::now()),
             pack_uuid: Mutex::new(0),
+            recenter_streak: AtomicU32::new(0),
             cfg,
         })
     }
@@ -94,18 +99,22 @@ fn ensure_boot(state: &Arc<State>, env: Env) {
         if !ok {
             crate::log_info("c-LoD: JNI surface incomplete — is this Paper 26.3+? Module idles.");
         }
-        // Effect keys (global refs, main thread).
+        // Effect keys (global refs, main thread). Atmosphere keys mirror the
+        // tier ids packgen emits: `{effect_atmosphere}_t{i}`, weakest first.
         if ok {
             let terrain = jni::make_key(env, &state.cfg.effect_terrain)
                 .map(|k| unsafe { new_global(env, k) })
                 .unwrap_or(0);
-            let atmosphere = jni::make_key(env, &state.cfg.effect_atmosphere)
-                .map(|k| unsafe { new_global(env, k) })
-                .unwrap_or(0);
-            *state.keys.lock().unwrap() = Some(Keys {
-                terrain,
-                atmosphere,
-            });
+            let tiers = state.cfg.atmo_tiers.max(1);
+            let mut atmo = Vec::with_capacity(tiers as usize);
+            for t in 0..tiers {
+                let id = format!("{}_t{t}", state.cfg.effect_atmosphere);
+                let key = jni::make_key(env, &id)
+                    .map(|k| unsafe { new_global(env, k) })
+                    .unwrap_or(0);
+                atmo.push(key);
+            }
+            *state.keys.lock().unwrap() = Some(Keys { terrain, atmo });
             // Pack UUID global.
             let uuid = jni::parse_uuid(env, &state.cfg.pack_uuid)
                 .map(|u| unsafe { new_global(env, u) })
@@ -172,10 +181,30 @@ fn coverage(state: &Arc<State>, p: &PlayerInfo) -> bool {
     state.atlas.cell_index(p.bx, p.bz).is_some()
 }
 
+/// Desired veil tier for a player: `Some(tier)` when covered (tier index
+/// into `Keys.atmo`, weakest first), `None` when effects must be off.
+/// Adaptive mode reads the scanned surface height under the player; the
+/// higher above ground they are, the weaker the veil (see further).
+pub fn desired_tier(state: &Arc<State>, p: &PlayerInfo) -> Option<u32> {
+    if !coverage(state, p) {
+        return None;
+    }
+    let max = state.cfg.atmo_tiers.max(1) - 1;
+    if !state.cfg.adaptive {
+        return Some(max);
+    }
+    let ground = state
+        .atlas
+        .height_at(p.bx, p.bz)
+        .map(i32::from)
+        .unwrap_or(state.cfg.sea_level);
+    Some(config::tier_from_delta(p.by - ground, max))
+}
+
 fn manage_players(state: &Arc<State>, env: Env) {
     let keys = state.keys.lock().unwrap().clone();
     let Some(keys) = keys else { return };
-    if keys.terrain == 0 && keys.atmosphere == 0 {
+    if keys.terrain == 0 && keys.atmo.iter().all(|k| *k == 0) {
         return;
     }
     let pack = state.pack.read().unwrap().clone();
@@ -186,7 +215,7 @@ fn manage_players(state: &Arc<State>, env: Env) {
     let players = jni::players(env);
     let mut seen: Vec<String> = Vec::new();
 
-    for p in players {
+    for p in &players {
         seen.push(p.uuid.clone());
         let mut st = state
             .per_player
@@ -218,25 +247,48 @@ fn manage_players(state: &Arc<State>, env: Env) {
             }
         }
 
-        // Post effects by coverage.
-        let want = coverage(state, &p);
+        // Terrain chain by coverage; veil tier by altitude adaptivity.
+        let want = coverage(state, p);
+        let tier = desired_tier(state, p);
         if let Some(handle) = jni::player_by_uuid(env, &p.uuid) {
             if want {
                 if keys.terrain != 0 && !st.terrain_on {
                     st.terrain_on = jni::add_effect(env, handle, unsafe { as_obj(keys.terrain) });
                 }
-                if keys.atmosphere != 0 && !st.atmosphere_on {
-                    st.atmosphere_on =
-                        jni::add_effect(env, handle, unsafe { as_obj(keys.atmosphere) });
-                }
-            } else {
-                if st.terrain_on {
-                    st.terrain_on =
-                        !jni::remove_effect(env, handle, unsafe { as_obj(keys.terrain) });
-                }
-                if st.atmosphere_on {
-                    st.atmosphere_on =
-                        !jni::remove_effect(env, handle, unsafe { as_obj(keys.atmosphere) });
+            } else if st.terrain_on {
+                st.terrain_on = !jni::remove_effect(env, handle, unsafe { as_obj(keys.terrain) });
+            }
+
+            // Atmosphere: switch tiers only when the tier actually changes,
+            // so the client never sees add/remove spam. Skipped entirely
+            // when no tier keys resolved.
+            if !keys.atmo.is_empty() {
+                let atmo_max = keys.atmo.len() - 1;
+                match (tier, st.atmo_tier) {
+                    (Some(want_t), cur_t) if cur_t != Some(want_t) => {
+                        if let Some(cur) = cur_t {
+                            let key = keys.atmo[(cur as usize).min(atmo_max)];
+                            if key != 0 {
+                                let off = jni::remove_effect(env, handle, unsafe { as_obj(key) });
+                                if off {
+                                    st.atmo_tier = None;
+                                }
+                            }
+                        }
+                        if st.atmo_tier.is_none() {
+                            let key = keys.atmo[(want_t as usize).min(atmo_max)];
+                            if key != 0 && jni::add_effect(env, handle, unsafe { as_obj(key) }) {
+                                st.atmo_tier = Some(want_t);
+                            }
+                        }
+                    }
+                    (None, Some(cur)) => {
+                        let key = keys.atmo[(cur as usize).min(atmo_max)];
+                        if key != 0 && jni::remove_effect(env, handle, unsafe { as_obj(key) }) {
+                            st.atmo_tier = None;
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -253,6 +305,49 @@ fn manage_players(state: &Arc<State>, env: Env) {
 
     if repack {
         state.repack_pending.store(false, Ordering::Relaxed);
+    }
+
+    maybe_recenter(state, &players);
+}
+
+/// Follow the players: when every player in the atlas world has drifted
+/// `recenter_blocks` (Chebyshev) outside the window for `recenter_patience`
+/// consecutive ticks, move the window to their centroid and rescan. Runs on
+/// the main thread; `snapshot` is this tick's online-player positions.
+fn maybe_recenter(state: &Arc<State>, snapshot: &[PlayerInfo]) {
+    if state.cfg.recenter_blocks == 0 || snapshot.is_empty() {
+        state.recenter_streak.store(0, Ordering::Relaxed);
+        return;
+    }
+    let wname = state.world_name.lock().unwrap().clone();
+    let relevant: Vec<(i32, i32)> = snapshot
+        .iter()
+        .filter(|p| wname.is_empty() || p.world == wname)
+        .map(|p| (p.bx, p.bz))
+        .collect();
+    if relevant.is_empty() {
+        state.recenter_streak.store(0, Ordering::Relaxed);
+        return;
+    }
+    let worst = relevant
+        .iter()
+        .map(|(x, z)| state.atlas.distance_outside(*x, *z))
+        .max()
+        .unwrap_or(0);
+    if worst < state.cfg.recenter_blocks {
+        state.recenter_streak.store(0, Ordering::Relaxed);
+        return;
+    }
+    let streak = state.recenter_streak.fetch_add(1, Ordering::Relaxed) + 1;
+    if streak >= state.cfg.recenter_patience.max(1) {
+        let cx = relevant.iter().map(|(x, _)| x).sum::<i32>() / relevant.len() as i32;
+        let cz = relevant.iter().map(|(_, z)| z).sum::<i32>() / relevant.len() as i32;
+        state.atlas.recenter(cx, cz);
+        state.recenter_streak.store(0, Ordering::Relaxed);
+        crate::log_info(&format!(
+            "c-LoD atlas recentered to ({cx}, {cz}); rescanning {} cells",
+            state.atlas.total_cells()
+        ));
     }
 }
 
@@ -310,10 +405,11 @@ pub fn maybe_rebuild_pack(state: &Arc<State>) {
     let new_pack = packgen::build(&state.cfg, &state.atlas);
     state.server.set_pack(new_pack.zip.clone());
     crate::log_info(&format!(
-        "c-LoD pack rebuilt: atlas v{} -> {} bytes, sha1 {}",
+        "c-LoD pack rebuilt: atlas v{} -> {} bytes, sha1 {}, veil tiers [{}]",
         new_pack.atlas_version,
         new_pack.zip.len(),
-        new_pack.sha1_hex
+        new_pack.sha1_hex,
+        new_pack.atmosphere_ids.join(", ")
     ));
     *state.pack.write().unwrap() = Some(Arc::new(new_pack));
     state.repack_pending.store(true, Ordering::Relaxed);
@@ -359,5 +455,61 @@ mod tests {
             bz: 0,
         };
         assert!(!coverage(&st, &p_world));
+    }
+
+    #[test]
+    fn adaptive_tiers_follow_altitude() {
+        let st = State::new(Config::parse(
+            "center_x=0;center_z=0;atlas_size=1024;cell_size=4;adaptive=true;atmo_tiers=3",
+        ));
+        *st.world_name.lock().unwrap() = "world".to_string();
+        st.atlas
+            .set(st.atlas.cells / 2, st.atlas.cells / 2, 64, false);
+        let in_world = |by: i32| PlayerInfo {
+            uuid: "u".into(),
+            world: "world".into(),
+            bx: 0,
+            by,
+            bz: 0,
+        };
+        // Ground level -> strongest veil (tier 2); high above -> weakest (0).
+        assert_eq!(desired_tier(&st, &in_world(64)), Some(2));
+        assert_eq!(desired_tier(&st, &in_world(96)), Some(1));
+        assert_eq!(desired_tier(&st, &in_world(200)), Some(0));
+        // Outside coverage -> effects off.
+        let out = PlayerInfo {
+            uuid: "u".into(),
+            world: "world".into(),
+            bx: 90_000,
+            by: 64,
+            bz: 0,
+        };
+        assert_eq!(desired_tier(&st, &out), None);
+    }
+
+    #[test]
+    fn non_adaptive_uses_strongest_tier() {
+        let st = State::new(Config::parse(
+            "center_x=0;center_z=0;atlas_size=1024;cell_size=4;adaptive=false;atmo_tiers=3",
+        ));
+        *st.world_name.lock().unwrap() = "world".to_string();
+        let p = PlayerInfo {
+            uuid: "u".into(),
+            world: "world".into(),
+            bx: 0,
+            by: 200,
+            bz: 0,
+        };
+        assert_eq!(desired_tier(&st, &p), Some(2));
+    }
+
+    #[test]
+    fn tier_keys_match_pack_ids() {
+        let cfg = Config::parse("atmo_tiers=4");
+        let ids: Vec<String> = (0..cfg.atmo_tiers)
+            .map(|t| format!("{}_t{t}", cfg.effect_atmosphere))
+            .collect();
+        assert_eq!(ids[0], "clod:atmosphere_t0");
+        assert_eq!(ids[3], "clod:atmosphere_t3");
     }
 }

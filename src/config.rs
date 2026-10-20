@@ -60,6 +60,20 @@ pub struct Config {
     pub rot_blend: f32,
     /// Upper bound on terrain height used to cull rays early.
     pub max_height: i32,
+    /// Number of atmosphere veil tiers emitted into the pack (1..=8).
+    /// Tier 0 is the weakest veil (far visibility), tier N-1 the strongest
+    /// (ground level). Requires `adaptive` to matter.
+    pub atmo_tiers: u32,
+    /// Altitude-adaptive LOD: pick the veil tier per player from the height
+    /// above terrain (high above ground -> weaker veil -> see further).
+    /// When false, covered players always get the strongest tier.
+    pub adaptive: bool,
+    /// Recenter the atlas window when all players drift this many blocks
+    /// outside it (Chebyshev). 0 disables recentering.
+    pub recenter_blocks: i32,
+    /// Consecutive adaptive ticks all players must stay outside the window
+    /// before the atlas recenters (anti-jitter patience).
+    pub recenter_patience: u32,
 }
 
 impl Default for Config {
@@ -91,6 +105,10 @@ impl Default for Config {
             sun_threshold: 0.18,
             rot_blend: 0.35,
             max_height: 320,
+            atmo_tiers: 3,
+            adaptive: true,
+            recenter_blocks: 1024,
+            recenter_patience: 20,
         }
     }
 }
@@ -197,7 +215,64 @@ impl Config {
         if let Some(v) = get("max_height").and_then(|v| v.parse::<i32>().ok()) {
             cfg.max_height = v.clamp(64, 1024);
         }
+        if let Some(v) = get("atmo_tiers").and_then(|v| v.parse::<u32>().ok()) {
+            cfg.atmo_tiers = v.clamp(1, 8);
+        }
+        if let Some(v) = get("adaptive") {
+            cfg.adaptive = !matches!(
+                v.to_ascii_lowercase().as_str(),
+                "false" | "0" | "off" | "no"
+            );
+        }
+        if let Some(v) = get("recenter_blocks").and_then(|v| v.parse::<i32>().ok()) {
+            cfg.recenter_blocks = v.clamp(0, 32_768);
+        }
+        if let Some(v) = get("recenter_patience").and_then(|v| v.parse::<u32>().ok()) {
+            cfg.recenter_patience = v.clamp(1, 3600);
+        }
         cfg
+    }
+}
+
+/// Map "height above terrain" (blocks) to a veil tier index in
+/// `0..=max` (0 = weakest veil, max = strongest). High above ground ->
+/// tier 0; near/below ground -> max. Pure so tests cover it without state.
+pub fn tier_from_delta(delta: i32, max: u32) -> u32 {
+    if max == 0 {
+        return 0;
+    }
+    let d = delta.clamp(0, 1_000_000);
+    // Band width grows from 8 blocks up: 0..31 -> strongest, 32..55 -> next,
+    // and so on until the weakest tier.
+    let level = ((d - 8).max(0) / 24) as u32;
+    max - level.min(max)
+}
+
+#[cfg(test)]
+mod tier_tests {
+    use super::tier_from_delta;
+
+    #[test]
+    fn tier_bands() {
+        // 3 tiers: max index 2.
+        assert_eq!(tier_from_delta(0, 2), 2); // ground level
+        assert_eq!(tier_from_delta(8, 2), 2);
+        assert_eq!(tier_from_delta(31, 2), 2);
+        assert_eq!(tier_from_delta(32, 2), 1);
+        assert_eq!(tier_from_delta(55, 2), 1);
+        assert_eq!(tier_from_delta(56, 2), 0);
+        assert_eq!(tier_from_delta(400, 2), 0); // high above ground
+    }
+
+    #[test]
+    fn tier_single() {
+        assert_eq!(tier_from_delta(-5, 0), 0);
+        assert_eq!(tier_from_delta(100, 0), 0);
+    }
+
+    #[test]
+    fn tier_negative_clamps() {
+        assert_eq!(tier_from_delta(-100, 3), 3);
     }
 }
 

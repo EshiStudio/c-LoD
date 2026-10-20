@@ -3,7 +3,7 @@
 //! Architecture (NO Display entities, NO client mods):
 //!   1. The module scans world heightmaps into a texture atlas (JNI, main
 //!      thread, budgeted per tick).
-//!   2. It generates a server resource pack containing two `/posteffect`
+//!   2. It generates a server resource pack containing the `/posteffect`
 //!      chains + GLSL shaders + the atlas PNG, and serves it over an
 //!      embedded HTTP server.
 //!   3. Players receive the pack (`setResourcePack`) and the module applies
@@ -11,8 +11,12 @@
 //!   4. On the client, `clod:lod_terrain` recovers the view rotation from
 //!      the vanilla sun/moon position (GameTime is a free data channel),
 //!      raymarches the heightfield atlas over sky pixels and paints distant
-//!      terrain. `clod:atmosphere` hides the render-distance edge with a
-//!      depth veil — rotation-free, works from the first frame.
+//!      terrain. `clod:atmosphere_t<n>` hides the render-distance edge with
+//!      a depth veil — rotation-free, works from the first frame.
+//!   5. Adaptive LOD (v2.1): the veil is emitted in N tiers; per player the
+//!      engine picks the tier from height above terrain — climb up and the
+//!      horizon sharpens, stay low and the edge stays hidden. The atlas
+//!      window follows the players when they all drift outside it.
 
 mod atlas;
 mod config;

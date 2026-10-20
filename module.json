@@ -1,5 +1,5 @@
 {
   "id": "lod",
-  "version": "2.0.0",
-  "description": "True server-side LOD: /posteffect chains + server resource pack (GLSL raymarched distant terrain from a heightmap atlas). No Display entities."
+  "version": "2.1.0",
+  "description": "True server-side LOD: /posteffect chains + server resource pack (GLSL raymarched distant terrain from a heightmap atlas), altitude-adaptive veil tiers, player-following atlas. No Display entities."
 }

@@ -10,8 +10,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
 pub struct Atlas {
-    pub center_x: i32,
-    pub center_z: i32,
+    /// Window center in world block coords; RwLock so the window can follow
+    /// players via `recenter` while the atlas lives behind an Arc.
+    center: RwLock<(i32, i32)>,
     pub size: i32,
     pub cell: i32,
     pub cells: u32,
@@ -25,7 +26,7 @@ pub struct Atlas {
     scanned: AtomicU64,
 }
 
-#[derive(Clone, Copy, Default, PartialEq)]
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
 pub struct Cell {
     pub height: i16,
     pub water: bool,
@@ -36,8 +37,7 @@ impl Atlas {
     pub fn new(center_x: i32, center_z: i32, size: i32, cell: i32, sea_level: i32) -> Self {
         let cells = (size / cell).max(1) as u32;
         Self {
-            center_x,
-            center_z,
+            center: RwLock::new((center_x, center_z)),
             size,
             cell,
             cells,
@@ -48,14 +48,28 @@ impl Atlas {
         }
     }
 
+    /// Window center (world block coords).
+    pub fn center(&self) -> (i32, i32) {
+        *self.center.read().unwrap()
+    }
+
+    pub fn center_x(&self) -> i32 {
+        self.center().0
+    }
+
+    pub fn center_z(&self) -> i32 {
+        self.center().1
+    }
+
     pub fn half(&self) -> i32 {
         self.size / 2
     }
 
     /// Cell indices for a world block coordinate, or None when outside.
     pub fn cell_index(&self, x: i32, z: i32) -> Option<(u32, u32)> {
-        let dx = x - (self.center_x - self.half());
-        let dz = z - (self.center_z - self.half());
+        let (cx, cz) = self.center();
+        let dx = x - (cx - self.half());
+        let dz = z - (cz - self.half());
         if dx < 0 || dz < 0 || dx >= self.size || dz >= self.size {
             return None;
         }
@@ -102,6 +116,53 @@ impl Atlas {
         self.cells as u64 * self.cells as u64
     }
 
+    /// Surface height at a world block position, when inside the window and
+    /// scanned. Used by adaptive tiering and recenter decisions.
+    pub fn height_at(&self, x: i32, z: i32) -> Option<i16> {
+        let (ix, iz) = self.cell_index(x, z)?;
+        self.get(ix, iz).map(|c| c.height)
+    }
+
+    /// Chebyshev distance a point lies OUTSIDE the atlas window (0 when
+    /// inside). Used to decide when the window should follow the players.
+    pub fn distance_outside(&self, x: i32, z: i32) -> i32 {
+        let (cx, cz) = self.center();
+        let lo_x = cx - self.half();
+        let lo_z = cz - self.half();
+        let dx = if x < lo_x {
+            lo_x - x
+        } else {
+            (x - (lo_x + self.size - 1)).max(0)
+        };
+        let dz = if z < lo_z {
+            lo_z - z
+        } else {
+            (z - (lo_z + self.size - 1)).max(0)
+        };
+        dx.max(dz)
+    }
+
+    /// Move the window to a new center and drop all cell data (version
+    /// bumps, so the pack rebuilds and clients re-download). Thread-safe:
+    /// may be called through the shared Arc from the main thread; the next
+    /// scan sweep refills from scratch.
+    pub fn recenter(&self, new_cx: i32, new_cz: i32) {
+        {
+            let mut c = self.center.write().unwrap();
+            if *c == (new_cx, new_cz) {
+                return;
+            }
+            *c = (new_cx, new_cz);
+        }
+        if let Ok(mut d) = self.data.write() {
+            for cell in d.iter_mut() {
+                *cell = Cell::default();
+            }
+        }
+        self.scanned.store(0, Ordering::Relaxed);
+        self.version.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Snapshot the grid into a flat buffer (row-major, z outer).
     pub fn snapshot(&self) -> Vec<Cell> {
         self.data.read().map(|d| d.clone()).unwrap_or_default()
@@ -128,12 +189,12 @@ impl Atlas {
 
     /// World X of cell center.
     pub fn cell_world_x(&self, ix: u32) -> i32 {
-        self.center_x - self.half() + (ix * self.cell as u32) as i32 + self.cell / 2
+        self.center_x() - self.half() + (ix * self.cell as u32) as i32 + self.cell / 2
     }
 
     /// World Z of cell center.
     pub fn cell_world_z(&self, iz: u32) -> i32 {
-        self.center_z - self.half() + (iz * self.cell as u32) as i32 + self.cell / 2
+        self.center_z() - self.half() + (iz * self.cell as u32) as i32 + self.cell / 2
     }
 
     /// Encode the atlas as RGBA8 pixels for the PNG texture:
@@ -231,5 +292,41 @@ mod tests {
         assert_eq!(t2[0], (15, 15));
         assert_eq!(t2[1], (0, 0));
         assert_eq!(t2[2], (1, 0));
+    }
+
+    #[test]
+    fn height_and_distance() {
+        let a = Atlas::new(0, 0, 64, 4, 63);
+        a.set(3, 5, 100, false);
+        // Cell (3,5) covers world x in [-20, -17], z in [-12, -9].
+        assert_eq!(a.height_at(-20, -12), Some(100));
+        assert_eq!(a.height_at(-17, -9), Some(100));
+        assert_eq!(a.height_at(0, 0), None); // valid=false
+        assert_eq!(a.height_at(9999, 0), None);
+
+        assert_eq!(a.distance_outside(0, 0), 0);
+        assert_eq!(a.distance_outside(31, -10), 0);
+        assert_eq!(a.distance_outside(40, 0), 9); // window is [-32, 31]
+        assert_eq!(a.distance_outside(-50, 0), 18);
+        assert_eq!(a.distance_outside(-50, 100), 69); // max(18, 69) Chebyshev
+    }
+
+    #[test]
+    fn recenter_resets_and_bumps() {
+        let a = Atlas::new(0, 0, 64, 4, 63);
+        a.set(0, 0, 90, true);
+        let v0 = a.version();
+        a.recenter(1000, -2000);
+        assert_eq!(a.center(), (1000, -2000));
+        assert_eq!(a.scanned_cells(), 0);
+        assert_eq!(a.version(), v0 + 1);
+        assert_eq!(a.get(0, 0), None);
+        // New window resolves around the new center.
+        assert_eq!(a.distance_outside(1000, -2000), 0);
+        assert!(a.distance_outside(0, 0) > 0);
+        // No-op recenter keeps version.
+        let v1 = a.version();
+        a.recenter(1000, -2000);
+        assert_eq!(a.version(), v1);
     }
 }

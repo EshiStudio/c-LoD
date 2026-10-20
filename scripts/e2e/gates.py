@@ -7,7 +7,7 @@ Posteffect architecture (v2). Gates (all hard):
   G3  the kernel came up and the loop started [c-LoD] kernel ready — starting engine loop
   G4  the Paper JNI surface resolved          [c-LoD] JNI bridge resolved: true
   G5  the atlas world resolved                [c-LoD] atlas world: <name>
-  G6  a resource pack was generated           [c-LoD] pack rebuilt: atlas vN -> X bytes, sha1 Y
+  G6  a resource pack was generated           [c-LoD] pack rebuilt: atlas vN -> X bytes, sha1 Y, veil tiers [...]
 Exit 0 only when every gate passes.
 """
 import re
@@ -48,13 +48,22 @@ def main(path: str) -> int:
     )
     m = re.search(r"atlas world: (\S+)", log)
     need(m is not None, "G5 atlas world resolved", "no Bukkit world available for the heightmap atlas")
-    pm = re.search(r"pack rebuilt: atlas v(\d+) -> (\d+) bytes, sha1 ([0-9a-f]{40})", log)
+    pm = re.search(
+        r"pack rebuilt: atlas v(\d+) -> (\d+) bytes, sha1 ([0-9a-f]{40}), veil tiers \[([^\]]*)\]",
+        log,
+    )
     need(pm is not None, "G6 resource pack generated", "packgen never produced clod-pack.zip")
     if pm:
         version = int(pm.group(1))
         size = int(pm.group(2))
+        tiers = [t for t in pm.group(4).split(", ") if t]
         need(version >= 1, "G6a atlas has data (v>=1)", f"atlas version={version}")
         need(size > 1024, "G6b pack size sane (>1KB)", f"pack size={size}")
+        need(
+            bool(tiers) and all(t.startswith("clod:atmosphere_t") for t in tiers),
+            "G6c adaptive veil tiers installed",
+            f"tiers={pm.group(4)!r}",
+        )
 
     print()
     if failed:
