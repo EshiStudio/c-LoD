@@ -1,5 +1,5 @@
 {
   "id": "lod",
-  "version": "4.0.0",
+  "version": "4.1.0",
   "description": "True server-side LOD: static /posteffect pack (built once per session) + per-player tier switching. GLSL raymarched distant terrain from a persistent heightmap atlas. No Display entities."
 }

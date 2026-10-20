@@ -76,9 +76,6 @@ pub struct Config {
     pub snow_line: f32,
     /// Sky/veil color blended over the render-distance edge.
     pub color_veil: [f32; 3],
-    /// Sun tracking: warmth threshold and temporal blend factor.
-    pub sun_threshold: f32,
-    pub rot_blend: f32,
     /// Upper bound on terrain height used to cull rays early.
     pub max_height: i32,
 }
@@ -113,8 +110,6 @@ impl Default for Config {
             color_water: [0.12, 0.24, 0.45],
             snow_line: 0.78,
             color_veil: [0.62, 0.74, 0.86],
-            sun_threshold: 0.18,
-            rot_blend: 0.35,
             max_height: 320,
         }
     }
@@ -232,12 +227,6 @@ impl Config {
         }
         if let Some(v) = get("snow_line").and_then(|v| v.parse::<f32>().ok()) {
             cfg.snow_line = v.clamp(0.0, 1.0);
-        }
-        if let Some(v) = get("sun_threshold").and_then(|v| v.parse::<f32>().ok()) {
-            cfg.sun_threshold = v.clamp(0.0, 1.0);
-        }
-        if let Some(v) = get("rot_blend").and_then(|v| v.parse::<f32>().ok()) {
-            cfg.rot_blend = v.clamp(0.02, 1.0);
         }
         if let Some(v) = get("max_height").and_then(|v| v.parse::<i32>().ok()) {
             cfg.max_height = v.clamp(64, 1024);

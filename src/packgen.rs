@@ -82,9 +82,6 @@ pub fn build(cfg: &Config, atlas: &Atlas) -> Pack {
 
     let map: Vec<(&str, String)> = vec![
         ("__FOV__", fmt_f(cfg.fov)),
-        ("__SCAN_THRESH__", fmt_f(cfg.sun_threshold)),
-        ("__ROT_BLEND__", fmt_f(cfg.rot_blend)),
-        ("__SOLVE_THRESH__", fmt_f(cfg.sun_threshold * 220.0)),
         ("__ORIGIN_X__", fmt_f(origin_x as f32)),
         ("__ORIGIN_Z__", fmt_f(origin_z as f32)),
         ("__ATLAS_SIZE__", fmt_f(atlas.size as f32)),
@@ -113,13 +110,18 @@ pub fn build(cfg: &Config, atlas: &Atlas) -> Pack {
     let lod_terrain_json = substitute(lod_terrain_tpl, &map);
     let atmosphere_json = substitute(atmosphere_tpl, &map);
 
-    let sun_scan = include_str!("../assets/glsl/sun_scan.fsh");
-    let sun_reduce = include_str!("../assets/glsl/sun_reduce.fsh");
-    let sun_solve = include_str!("../assets/glsl/sun_solve.fsh");
+    let col_scan = include_str!("../assets/glsl/col_scan.fsh");
+    let rot_solve = include_str!("../assets/glsl/rot_solve.fsh");
     let rot_copy = include_str!("../assets/glsl/rot_copy.fsh");
     let lod_terrain = include_str!("../assets/glsl/lod_terrain.fsh");
     let clod_blit = include_str!("../assets/glsl/clod_blit.fsh");
     let atmosphere = include_str!("../assets/glsl/atmosphere.fsh");
+    // v4.1 camera channel: the vanilla sky core-shader override. The client
+    // resolves core shader sources through the resource system (verified:
+    // RenderPipelines binds pipeline/sky to shader ids "core/sky"), so the
+    // server pack layers the payload-instrumented sky on top of vanilla.
+    let sky_vsh = include_str!("../assets/glsl/sky.vsh");
+    let sky_fsh = include_str!("../assets/glsl/sky.fsh");
 
     // 26.3 pack.mcmeta schema (verified against vanilla embedded packs and
     // PackFormat$IntermediaryFormat): packs declaring a format newer than 64
@@ -142,14 +144,10 @@ pub fn build(cfg: &Config, atlas: &Atlas) -> Pack {
         "assets/clod/post_effect/atmosphere.json",
         atmosphere_json.as_bytes(),
     );
-    zip.add("assets/clod/shaders/post/sun_scan.fsh", sun_scan.as_bytes());
+    zip.add("assets/clod/shaders/post/col_scan.fsh", col_scan.as_bytes());
     zip.add(
-        "assets/clod/shaders/post/sun_reduce.fsh",
-        sun_reduce.as_bytes(),
-    );
-    zip.add(
-        "assets/clod/shaders/post/sun_solve.fsh",
-        sun_solve.as_bytes(),
+        "assets/clod/shaders/post/rot_solve.fsh",
+        rot_solve.as_bytes(),
     );
     zip.add("assets/clod/shaders/post/rot_copy.fsh", rot_copy.as_bytes());
     zip.add(
@@ -164,6 +162,10 @@ pub fn build(cfg: &Config, atlas: &Atlas) -> Pack {
         "assets/clod/shaders/post/atmosphere.fsh",
         atmosphere.as_bytes(),
     );
+    // Camera channel: vanilla sky core-shader override (exact 26.3 vsh +
+    // payload fsh). Resolves through the resource stack above vanilla.
+    zip.add("assets/minecraft/shaders/core/sky.vsh", sky_vsh.as_bytes());
+    zip.add("assets/minecraft/shaders/core/sky.fsh", sky_fsh.as_bytes());
     zip.add("assets/clod/textures/effect/atlas.png", &atlas_png);
     let zip_bytes = zip.finish();
 
@@ -208,7 +210,10 @@ mod tests {
 
         // Must contain the essential entries: scan by walking central dir.
         let count = u16::from_le_bytes([pack.zip[n - 12], pack.zip[n - 11]]) as usize;
-        assert_eq!(count, 11, "pack.mcmeta + 2 json + 7 fsh + atlas.png");
+        assert_eq!(
+            count, 12,
+            "pack.mcmeta + 2 json + 6 fsh + atlas.png + sky.vsh + sky.fsh"
+        );
 
         // JSON chains are valid JSON (parenthesis balance + token-free).
         let s = String::from_utf8_lossy(pack.zip.as_slice());
@@ -275,5 +280,79 @@ mod tests {
         assert_eq!(fmt_f(0.0), "0.0");
         assert_eq!(fmt_f(-1.5), "-1.5");
         assert_eq!(fmt_f(0.25), "0.25");
+    }
+
+    /// Walks the local file headers of a STORE-only zip produced by zipw.
+    fn zip_entries(zip: &[u8]) -> Vec<(String, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut p = 0usize;
+        while p + 4 <= zip.len() && zip[p..p + 4] == [0x50, 0x4b, 0x03, 0x04] {
+            let name_len = u16::from_le_bytes([zip[p + 26], zip[p + 27]]) as usize;
+            let extra_len = u16::from_le_bytes([zip[p + 28], zip[p + 29]]) as usize;
+            let size =
+                u32::from_le_bytes([zip[p + 18], zip[p + 19], zip[p + 20], zip[p + 21]]) as usize;
+            let name = String::from_utf8_lossy(&zip[p + 30..p + 30 + name_len]).into_owned();
+            let data_start = p + 30 + name_len + extra_len;
+            out.push((name, zip[data_start..data_start + size].to_vec()));
+            p = data_start + size;
+        }
+        out
+    }
+
+    #[test]
+    fn camera_channel_sky_override_is_shipped() {
+        // v4.1: the pack must layer the payload-instrumented vanilla sky core
+        // shader over the vanilla one (resolved through the resource system),
+        // and the sun tracker shaders must be gone.
+        let cfg = Config::parse("");
+        let atlas = Atlas::new(0, 0, 256, 4, 63);
+        let pack = build(&cfg, &atlas);
+        let entries = zip_entries(&pack.zip);
+        let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+
+        assert!(
+            names.contains(&"assets/minecraft/shaders/core/sky.fsh"),
+            "sky.fsh override missing: {names:?}"
+        );
+        assert!(names.contains(&"assets/minecraft/shaders/core/sky.vsh"));
+        assert!(
+            !names.iter().any(|n| n.contains("sun_")),
+            "sun tracker must be gone"
+        );
+
+        let sky = &entries
+            .iter()
+            .find(|(n, _)| n == "assets/minecraft/shaders/core/sky.fsh")
+            .unwrap()
+            .1;
+        let sky = String::from_utf8_lossy(sky);
+        assert!(sky.contains("camera channel"), "payload marker missing");
+        assert!(
+            sky.contains("transpose(mat3(ModelViewMat))"),
+            "basis source missing"
+        );
+        assert!(
+            sky.contains("#include <minecraft:projection.glsl>"),
+            "ProjMat include missing"
+        );
+
+        let chain = &entries
+            .iter()
+            .find(|(n, _)| n == "assets/clod/post_effect/lod_terrain.json")
+            .unwrap()
+            .1;
+        let chain = String::from_utf8_lossy(chain);
+        assert!(
+            chain.contains("clod:post/col_scan"),
+            "col_scan pass missing"
+        );
+        assert!(
+            chain.contains("clod:post/rot_solve"),
+            "rot_solve pass missing"
+        );
+        assert!(
+            !chain.contains("sun_"),
+            "sun passes must be gone from the chain"
+        );
     }
 }

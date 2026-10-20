@@ -2,21 +2,23 @@
 #extension GL_ARB_separate_shader_objects : require
 #include <minecraft:globals.glsl>
 
-// c-LoD pass 5: the actual level-of-distant-detail renderer.
+// c-LoD pass 4: the actual level-of-distant-detail renderer.
 //
 // For every pixel that shows sky (device depth ~ 1) we march a view ray
 // against the heightfield atlas shipped in the server resource pack and
-// shade the hit. The ray is built from the camera basis recovered by the
-// sun tracker (clod_rot target) and the configured FOV. Camera position
-// comes from the Globals UBO (CameraBlockPos + CameraOffset), which the
-// engine binds to every post pass — verified against vanilla box_blur.fsh.
+// shade the hit. The ray is built from the camera basis delivered by the
+// CAMERA CHANNEL (v4.1): the sky shader encodes yaw/pitch/fov into the
+// alpha of the leftmost columns, col_scan + rot_solve decode it into the
+// clod_rot target. Works at any time of day and any camera orientation —
+// no sun in view required. Camera position comes from the Globals UBO
+// (CameraBlockPos + CameraOffset), bound to every post pass.
 //
 // Non-sky pixels pass through untouched: real chunks always win.
 
 uniform sampler2D InSampler;      // minecraft:main color
 uniform sampler2D InDepthSampler; // minecraft:main depth
 uniform sampler2D AtlasSampler;   // clod:textures/effect/atlas.png (RG = height, B = water)
-uniform sampler2D RotSampler;     // clod:clod_rot_a (1x1 persistent)
+uniform sampler2D RotSampler;     // clod:clod_rot_a (1x1 persistent, camera channel)
 
 layout(std140) uniform SamplerInfo {
     vec2 OutSize;
@@ -33,7 +35,7 @@ layout(std140) uniform ClodParams {
     vec4 LodParams;
 };
 
-// x = fog start (blocks), y = fog end (blocks), z = fov (deg), w = unused
+// x = fog start (blocks), y = fog end (blocks), z = static fov fallback, w = unused
 layout(std140) uniform ClodFog {
     vec4 FogParams;
 };
@@ -98,6 +100,9 @@ void main() {
         return;
     }
 
+    // v4.0 encoding preserved: R = az/2pi, G = (el+pi/2)/pi, B = conf.
+    // A = fov byte (new in v4.1): the REAL vertical fov measured by the sky
+    // shader from ProjMat[1][1] — spyglass zoom and fov options just work.
     float az = rot.r * 6.28318530718;
     float el = rot.g * PI - PI * 0.5;
 
@@ -105,7 +110,7 @@ void main() {
     vec3 R = vec3(-sin(az), 0.0, cos(az));
     vec3 U = vec3(-cos(az) * sin(el), cos(el), -sin(az) * sin(el));
 
-    float fov = FogParams.z;
+    float fov = 5.0 + rot.a * 115.0; // inverse of (fov-5)/115*254
     float tanH = tan(radians(fov) * 0.5);
     float aspect = OutSize.x / max(OutSize.y, 1.0);
 

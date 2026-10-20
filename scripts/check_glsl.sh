@@ -2,13 +2,15 @@
 # Validates the c-LoD post-effect shaders with glslangValidator.
 #
 # The shaders are written for Minecraft 26.3 (shaderc-based compilation):
-#   - `#include <minecraft:globals.glsl>` is resolved by the game, so we
-#     replace it with a minimal stub of the Globals UBO (verified against
-#     the vanilla box_blur.fsh consumer — shaderc accepts only #include,
-#     the legacy #moj_import directive no longer exists in 26.3).
+#   - `#include <minecraft:...>` is resolved by the game, so we replace the
+#     known includes with exact stubs (Globals for post chains; Fog /
+#     DynamicTransforms / Projection for the sky camera-channel override —
+#     layouts extracted from client.jar). Shaderc accepts only #include,
+#     the legacy #moj_import directive no longer exists in 26.3.
 #   - Custom UBOs come from the chain JSON at runtime; the harness appends
 #     declaration stubs collected from assets/post_effect/*.json.
-#   - texCoord is the varying produced by vanilla core/screenquad.vsh.
+#   - Post shaders get the screenquad texCoord varying; the sky override
+#     (sky.vsh/sky.fsh) is compiled in its own vertex/fragment stages.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -36,6 +38,53 @@ GLOBALS_STUB = """layout(std140) uniform Globals {
     int UseRgss;
 };"""
 
+# Vanilla 26.3 core-shader include headers (extracted from client.jar) — the
+# sky camera-channel override pulls these instead of the post-chain Globals.
+FOG_STUB = """layout(std140) uniform Fog {
+    vec4 FogColor;
+    float FogEnvironmentalStart;
+    float FogEnvironmentalEnd;
+    float FogRenderDistanceStart;
+    float FogRenderDistanceEnd;
+    float FogSkyEnd;
+    float FogCloudsEnd;
+};
+float linear_fog_value(float vertexDistance, float fogStart, float fogEnd) {
+    if (vertexDistance <= fogStart) { return 0.0; }
+    else if (vertexDistance >= fogEnd) { return 1.0; }
+    return (vertexDistance - fogStart) / (fogEnd - fogStart);
+}
+float total_fog_value(float sphericalVertexDistance, float cylindricalVertexDistance, float environmentalStart, float environmantalEnd, float renderDistanceStart, float renderDistanceEnd) {
+    return max(linear_fog_value(sphericalVertexDistance, environmentalStart, environmantalEnd), linear_fog_value(cylindricalVertexDistance, renderDistanceStart, renderDistanceEnd));
+}
+vec4 apply_fog(vec4 inColor, float sphericalVertexDistance, float cylindricalVertexDistance, float environmentalStart, float environmantalEnd, float renderDistanceStart, float renderDistanceEnd, vec4 fogColor) {
+    float fogValue = total_fog_value(sphericalVertexDistance, cylindricalVertexDistance, environmentalStart, environmantalEnd, renderDistanceStart, renderDistanceEnd);
+    return vec4(mix(inColor.rgb, fogColor.rgb, fogValue * fogColor.a), inColor.a);
+}
+float fog_spherical_distance(vec3 pos) { return length(pos); }
+float fog_cylindrical_distance(vec3 pos) { return max(length(pos.xz), abs(pos.y)); }"""
+
+DYNAMIC_TRANSFORMS_STUB = """layout(std140) uniform DynamicTransforms {
+    mat4 ModelViewMat;
+    mat4 TextureMat;
+    vec4 ColorModulator;
+    vec3 ModelOffset;
+};"""
+
+PROJECTION_STUB = """layout(std140) uniform Projection {
+    mat4 ProjMat;
+};"""
+
+INCLUDES = {
+    "#include <minecraft:globals.glsl>": GLOBALS_STUB,
+    "#include <minecraft:fog.glsl>": FOG_STUB,
+    "#include <minecraft:dynamictransforms.glsl>": DYNAMIC_TRANSFORMS_STUB,
+    "#include <minecraft:projection.glsl>": PROJECTION_STUB,
+}
+
+# Vanilla 26.3 include headers (extracted from client.jar) — the sky override
+# pulls them in instead of the post-chain Globals UBO.
+
 def load_chain(p: Path):
     # Templates contain __TOKEN__ placeholders (substituted by packgen);
     # replace them with 0 for validation.
@@ -49,9 +98,10 @@ for chain in Path("assets/post_effect").glob("*.json"):
         for name, uniforms in (p.get("uniforms") or {}).items():
             ubos[name] = [(u["name"], u["type"]) for u in uniforms]
 
-for fsh in sorted(Path("assets/glsl").glob("*.fsh")):
+for fsh in sorted(list(Path("assets/glsl").glob("*.fsh")) + list(Path("assets/glsl").glob("*.vsh"))):
     src = fsh.read_text()
-    src = src.replace("#include <minecraft:globals.glsl>", GLOBALS_STUB)
+    for inc, stub in INCLUDES.items():
+        src = src.replace(inc, stub)
     # Legacy directive (pre-26.3): reject loudly if it sneaks back in.
     if "#moj_import" in src:
         print(f"FAIL {fsh.name}: #moj_import is not supported by the 26.3 shaderc pipeline")
@@ -89,18 +139,27 @@ for fsh in sorted(Path("assets/glsl").glob("*.fsh")):
         lines.append("};")
         extra.append("\n".join(lines))
 
-    if "layout(location = 0) in vec2 texCoord" not in src:
+    # texCoord is the varying produced by vanilla core/screenquad.vsh — only
+    # post shaders need it; the sky override has its own varyings (and the
+    # vsh runs its own stage).
+    if not re.search(r"layout\(location = 0\) in", src):
         extra.append("layout(location = 0) in vec2 texCoord;")
-    (work / (fsh.stem + ".comp.frag")).write_text(src + "\n" + "\n".join(extra) + "\n")
+    ext = "vert" if fsh.suffix == ".vsh" else "frag"
+    (work / (fsh.stem + ".comp." + ext)).write_text(src + "\n" + "\n".join(extra) + "\n")
 PYEOF
 
 status=0
-for comp in "$WORK"/*.comp.frag; do
-    base=$(basename "$comp" .comp.frag)
-    if glslangValidator -S frag -G -o /dev/null "$comp" > "$WORK/$base.log" 2>&1; then
-        echo "OK   assets/glsl/$base.fsh"
+for comp in "$WORK"/*.comp.frag "$WORK"/*.comp.vert; do
+    [ -e "$comp" ] || continue
+    base=$(basename "$comp")
+    stage=frag
+    case "$comp" in
+        *.vert) stage=vert ;;
+    esac
+    if glslangValidator -S "$stage" -G -o /dev/null "$comp" > "$WORK/$base.log" 2>&1; then
+        echo "OK   assets/glsl/${base%.comp.*}.$([ "$stage" = vert ] && echo vsh || echo fsh)"
     else
-        echo "FAIL assets/glsl/$base.fsh"
+        echo "FAIL assets/glsl/${base%.comp.*}"
         cat "$WORK/$base.log"
         status=1
     fi
