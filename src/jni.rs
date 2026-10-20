@@ -118,6 +118,7 @@ struct WorldIds {
     m_highest_block: jmethodID,
     m_get_block_at: jmethodID,
     m_chunk_loaded: jmethodID,
+    m_get_chunk: jmethodID,
 }
 // Raw method-ID pointers cached process-lifetime; consumed main-thread-only.
 unsafe impl Send for WorldIds {}
@@ -192,6 +193,7 @@ fn world_ids(env: Env, world: jobject) -> Option<WorldIds> {
         m_name: bind_method(env, cls_local, cls, "getName", "()Ljava/lang/String;")?,
         m_highest_block: bind_method(env, cls_local, cls, "getHighestBlockYAt", "(II)I")?,
         m_chunk_loaded: bind_method(env, cls_local, cls, "isChunkLoaded", "(II)Z")?,
+        m_get_chunk: bind_method(env, cls_local, cls, "getChunkAt", "(II)Lorg/bukkit/Chunk;")?,
         m_get_block_at: bind_method(
             env,
             cls_local,
@@ -616,6 +618,19 @@ pub fn find_world(env: Env, name: &str) -> Option<WorldRef> {
     }
     clear_if_pending(env);
     None
+}
+
+/// Force-load (and, if needed, generate) one chunk. Used once at boot to
+/// warm the core region for the static snapshot.
+pub fn warm_chunk(env: Env, world: jobject, cx: i32, cz: i32) -> bool {
+    let Some(wid) = world_ids(env, world) else {
+        clear_if_pending(env);
+        return false;
+    };
+    let _ = env.call_object_method(world, wid.m_get_chunk, &[ji(cx), ji(cz)]);
+    let ok = !env.exception_check();
+    clear_if_pending(env);
+    ok
 }
 
 /// Sample the surface height at one column. Returns (blockY, isLiquid).

@@ -42,6 +42,11 @@ pub struct Config {
     pub atlas_cache: bool,
     /// Where the atlas snapshot is persisted.
     pub atlas_path: String,
+    /// Warm-up radius in CHUNKS around the atlas center: at world resolution
+    /// the engine synchronously loads/generates (2*warm+1)^2 chunks so the
+    /// static snapshot always covers the core region (modern vanilla keeps
+    /// no spawn chunks loaded, and the scan never forces generation).
+    pub warm_chunks: i32,
     /// Camera FOV (vertical, degrees) the GLSL ray reconstruction assumes.
     /// Must match the client's FOV for pixel-perfect alignment; 70 is vanilla.
     pub fov: f32,
@@ -90,6 +95,7 @@ impl Default for Config {
             scan_deadline_secs: 900,
             atlas_cache: true,
             atlas_path: "c-LoD-atlas.bin".to_string(),
+            warm_chunks: 8,
             fov: 70.0,
             lod_near: 96.0,
             veil_far: 512.0,
@@ -171,6 +177,9 @@ impl Config {
             if !v.is_empty() {
                 cfg.atlas_path = v.to_string();
             }
+        }
+        if let Some(v) = get("warm_chunks").and_then(|v| v.parse::<i32>().ok()) {
+            cfg.warm_chunks = v.clamp(0, 32);
         }
         if let Some(v) = get("fov").and_then(|v| v.parse::<f32>().ok()) {
             if (30.0..=150.0).contains(&v) {
@@ -280,6 +289,7 @@ mod tests {
         assert_eq!(c.scan_deadline_secs, 900);
         assert!(c.atlas_cache);
         assert_eq!(c.atlas_path, "c-LoD-atlas.bin");
+        assert_eq!(c.warm_chunks, 8);
 
         let c = Config::parse("scan_deadline_secs=7;atlas_cache=off;atlas_path=/tmp/atlas.bin");
         assert_eq!(c.scan_deadline_secs, 10, "clamped to minimum");

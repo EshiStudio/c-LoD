@@ -168,7 +168,7 @@ jobs:
       - name: Boot #1 (fresh world, fast static-pack config)
         working-directory: dist
         env:
-          CLOD_OPTS: "scan_deadline_secs=25;tick_ms=200;atlas_size=1024;cell_size=4;http_port=8199"
+          CLOD_OPTS: "scan_deadline_secs=60;tick_ms=200;atlas_size=1024;cell_size=4;http_port=8199"
         run: |
           java -Xmx2G -jar launcher.jar > boot1.log 2>&1 &
           SRV=$!
@@ -189,7 +189,7 @@ jobs:
       - name: Boot #2 (restart — atlas cache must reproduce the SAME sha1)
         working-directory: dist
         env:
-          CLOD_OPTS: "scan_deadline_secs=25;tick_ms=200;atlas_size=1024;cell_size=4;http_port=8199"
+          CLOD_OPTS: "scan_deadline_secs=60;tick_ms=200;atlas_size=1024;cell_size=4;http_port=8199"
         run: |
           java -Xmx2G -jar launcher.jar > boot2.log 2>&1 &
           SRV=$!

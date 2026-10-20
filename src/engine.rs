@@ -49,6 +49,8 @@ pub struct State {
     /// True when the atlas came from the disk cache (=> finalize immediately
     /// after the world resolves; bytes must match the previous session).
     pub restored: bool,
+    /// Set after the one-time chunk warm-up around the atlas center.
+    pub warmed: AtomicU8,
     /// When the atlas world was first resolved (scan deadline anchor).
     pub world_seen_at: Mutex<Option<std::time::Instant>>,
     pub scan_seq: AtomicU64,
@@ -131,6 +133,7 @@ impl State {
             pack: RwLock::new(None),
             phase: AtomicU8::new(PHASE_BOOT),
             restored,
+            warmed: AtomicU8::new(0),
             world_seen_at: Mutex::new(None),
             scan_seq: AtomicU64::new(0),
             world_obj: Mutex::new(0),
@@ -214,6 +217,27 @@ fn ensure_boot(state: &Arc<State>, env: Env) {
                 }
                 // Anchor the scan deadline at world resolution.
                 *state.world_seen_at.lock().unwrap() = Some(std::time::Instant::now());
+                // One-time core warm-up: modern vanilla keeps no spawn
+                // chunks loaded and the scan never forces generation, so
+                // without this the static snapshot could cover nothing.
+                if state.cfg.warm_chunks > 0 {
+                    let w = state.cfg.warm_chunks;
+                    let mut loaded = 0usize;
+                    for cx in -w..=w {
+                        for cz in -w..=w {
+                            if jni::warm_chunk(env, unsafe { as_obj(g) }, cx, cz) {
+                                loaded += 1;
+                            }
+                        }
+                    }
+                    state.warmed.store(1, Ordering::SeqCst);
+                    crate::log_info(&format!(
+                        "c-LoD core warmed: {}x{} chunks around atlas center ({} loaded)",
+                        2 * w + 1,
+                        2 * w + 1,
+                        loaded
+                    ));
+                }
             }
         }
     }
