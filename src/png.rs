@@ -40,6 +40,10 @@ fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
     crc_input.extend_from_slice(kind);
     crc_input.extend_from_slice(data);
     out.extend_from_slice(kind);
+    // Local fix: the chunk payload was never written, so every PNG emitted by
+    // this encoder was the 44-byte skeleton (IHDR/IDAT with no data) and the
+    // client could never upload the atlas texture -> LOD never rendered.
+    out.extend_from_slice(data);
     out.extend_from_slice(&crc32_bytes(&crc_input));
 }
 
@@ -108,7 +112,6 @@ mod tests {
 
     #[test]
     fn png_decodable_by_width_height() {
-        // Reference decoder-free check: total size math is consistent.
         let (w, h) = (64u32, 32u32);
         let px = vec![7u8; (w * h * 4) as usize];
         let png = encode_png(w, h, &px);
@@ -123,5 +126,44 @@ mod tests {
         // zlib wrapper: 2 bytes head + stored blocks overhead + 4 bytes adler
         let overhead = 2 + 4 + (expected_raw / 65535 + 1) * 5;
         assert_eq!(len, expected_raw + overhead);
+    }
+
+    #[test]
+    fn png_chunks_carry_their_payload() {
+        // Regression: `chunk()` used to write the length, tag and CRC but not
+        // the data itself, so every atlas texture was a 44-byte skeleton.
+        let (w, h) = (16u32, 8u32);
+        let px: Vec<u8> = (0..(w * h * 4)).map(|i| (i % 251) as u8).collect();
+        let png = encode_png(w, h, &px);
+
+        let mut p = 8usize; // after signature
+        let mut seen = Vec::new();
+        while p + 8 <= png.len() {
+            let len =
+                u32::from_be_bytes([png[p], png[p + 1], png[p + 2], png[p + 3]]) as usize;
+            let kind = &png[p + 4..p + 8];
+            let data = &png[p + 8..p + 8 + len];
+            seen.push((String::from_utf8_lossy(kind).to_string(), len));
+            if kind == b"IHDR" {
+                assert_eq!(data.len(), 13);
+                assert_eq!(&data[0..4], &w.to_be_bytes());
+                assert_eq!(&data[4..8], &h.to_be_bytes());
+                assert_eq!(data[8], 8); // bit depth
+                assert_eq!(data[9], 6); // RGBA
+            }
+            if kind == b"IEND" {
+                assert_eq!(len, 0);
+            }
+            p += 12 + len;
+        }
+        assert_eq!(p, png.len(), "chunk walk must land exactly on EOF");
+        assert_eq!(seen[0].0, "IHDR");
+        assert_eq!(seen.last().unwrap().0, "IEND");
+        let idat = seen.iter().find(|(k, _)| k == "IDAT").expect("IDAT");
+        assert!(
+            idat.1 > (w * h * 4) as usize,
+            "IDAT payload must carry the raw scanlines, got {} bytes",
+            idat.1
+        );
     }
 }

@@ -19,6 +19,10 @@ pub struct Config {
     pub pack_uuid: String,
     /// Prompt shown by the client for the resource pack.
     pub pack_prompt: String,
+    /// Push the pack with `force=true`: the vanilla client applies it without
+    /// the confirmation dialog. Handy on a test server so the pack can never
+    /// be missed/declined (the dialog is easy to dismiss by accident).
+    pub pack_force: bool,
     /// World used for the heightmap atlas (empty = first Bukkit world).
     pub world: String,
     /// Atlas center in block coordinates (default: world spawn).
@@ -47,6 +51,13 @@ pub struct Config {
     /// static snapshot always covers the core region (modern vanilla keeps
     /// no spawn chunks loaded, and the scan never forces generation).
     pub warm_chunks: i32,
+    /// Streamed chunk-major scan: number of chunks to force-load, sample and
+    /// release per engine tick. 0 keeps the classic cell sweep (only already
+    /// loaded chunks are sampled, so coverage is bounded by `warm_chunks`).
+    /// With streaming the atlas may span kilometres while resident memory
+    /// stays at a handful of chunks: each chunk is generated, sampled at
+    /// `cell_size` resolution, then un-forced immediately.
+    pub stream_chunks: i32,
     /// Camera FOV (vertical, degrees) the GLSL ray reconstruction assumes.
     /// Must match the client's FOV for pixel-perfect alignment; 70 is vanilla.
     pub fov: f32,
@@ -62,6 +73,12 @@ pub struct Config {
     /// Live-verified on a real client (sky reads exactly 0.0); 0.05 is the
     /// vanilla camera near plane. Only touch if Mojang changes the mapping.
     pub depth_near: f32,
+    /// Debug visualization for the LOD pass.
+    ///   0 = normal rendering
+    ///   1 = sky pixels are replaced by vec3(conf,0,0): black = tracker never
+    ///       locked, red = confidence 1, normal sky = the pass did not run or
+    ///       the depth/sky test never matched.
+    pub debug_lod: u8,
     /// Sea level used for water flagging and LOD water rendering.
     pub sea_level: i32,
     /// Engine tick interval in milliseconds.
@@ -90,6 +107,7 @@ impl Default for Config {
             pack_base_url: String::new(),
             pack_uuid: "6b1f2f7e-9c0d-4a4b-8b0a-b10d1b4ab100".to_string(),
             pack_prompt: String::new(),
+            pack_force: false,
             world: String::new(),
             center_x: 0,
             center_z: 0,
@@ -100,10 +118,12 @@ impl Default for Config {
             atlas_cache: true,
             atlas_path: "c-LoD-atlas.bin".to_string(),
             warm_chunks: 8,
+            stream_chunks: 0,
             fov: 70.0,
             lod_near: 96.0,
             veil_far: 512.0,
             depth_near: 0.05,
+            debug_lod: 0,
             sea_level: 63,
             tick_ms: 1000,
             effect_terrain: "clod:lod_terrain".to_string(),
@@ -146,6 +166,9 @@ impl Config {
         if let Some(v) = get("pack_prompt") {
             cfg.pack_prompt = v.to_string();
         }
+        if let Some(v) = get("pack_force") {
+            cfg.pack_force = matches!(v, "1" | "on" | "true" | "yes");
+        }
         if let Some(v) = get("world") {
             cfg.world = v.to_string();
         }
@@ -186,6 +209,9 @@ impl Config {
         if let Some(v) = get("warm_chunks").and_then(|v| v.parse::<i32>().ok()) {
             cfg.warm_chunks = v.clamp(0, 32);
         }
+        if let Some(v) = get("stream_chunks").and_then(|v| v.parse::<i32>().ok()) {
+            cfg.stream_chunks = v.clamp(0, 64);
+        }
         if let Some(v) = get("fov").and_then(|v| v.parse::<f32>().ok()) {
             if (30.0..=150.0).contains(&v) {
                 cfg.fov = v;
@@ -206,11 +232,14 @@ impl Config {
                 cfg.depth_near = v;
             }
         }
+        if let Some(v) = get("debug_lod").and_then(|v| v.parse::<u8>().ok()) {
+            cfg.debug_lod = v.min(5);
+        }
         if let Some(v) = get("sea_level").and_then(|v| v.parse::<i32>().ok()) {
             cfg.sea_level = v;
         }
         if let Some(v) = get("tick_ms").and_then(|v| v.parse::<u64>().ok()) {
-            cfg.tick_ms = v.clamp(200, 60_000);
+            cfg.tick_ms = v.clamp(50, 60_000);
         }
         if let Some(v) = get("effect_terrain") {
             cfg.effect_terrain = v.to_string();

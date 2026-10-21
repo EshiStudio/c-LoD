@@ -2,13 +2,24 @@
 #extension GL_ARB_separate_shader_objects : require
 #include <minecraft:globals.glsl>
 
-// c-LoD pass 1: sun candidate scan.
-// For every screen pixel that shows sky (device depth ~ 1.0), estimate how
-// likely it belongs to the sun (day) or moon (night) disc. The vanilla sun
-// travels in the world X-Y plane: dir = (cos t, sin t, 0), t = 2*pi*fract(GameTime).
-// The result is a weight field reduced by the next passes into a 1x1
-// rotation estimate — this is how c-LoD recovers the view direction without
-// any client mod: everything comes from the scene itself.
+// c-LoD pass 1: sun/moon candidate scan.
+//
+// Every sky pixel is scored 0..1 for "this looks like the celestial body".
+// The score, its screen position and the sky mask are reduced by the next
+// passes into a 1x1 rotation estimate — this is how c-LoD recovers the view
+// direction without any client mod: everything comes from the scene itself.
+//
+// The vanilla sprites are strongly coloured:
+//   assets/minecraft/textures/environment/celestial/sun.png    -> (1,1,0)
+//   assets/minecraft/textures/environment/celestial/moon/*.png -> (0,0,1)
+// so "yellow-ness" = min(r,g) - b separates the day sun from white clouds and
+// blue sky, and "blue-ness" = b - max(r,g) finds the moon at night.
+// (The old r - 0.92*max(g,b) kernel scored white clouds and the yellow sun
+// identically — 0.08 — so the tracker could never isolate the disc.)
+//
+// IMPORTANT: post-chain internal targets are 8-bit (PostChainConfig's
+// InternalTarget has no format field), so EVERY value written here must stay
+// inside 0..1. The reduce pass averages (never sums) for the same reason.
 
 uniform sampler2D InSampler;      // minecraft:main (color)
 uniform sampler2D InDepthSampler; // minecraft:main (depth buffer)
@@ -18,7 +29,7 @@ layout(std140) uniform SamplerInfo {
     vec2 InSize;
 };
 
-// x = fov (deg), y = warmth threshold, z = min luma, w = unused
+// x = fov (deg), y = noise gate (0..1), z,w unused
 layout(std140) uniform ClodScan {
     vec4 ScanParams;
 };
@@ -26,47 +37,40 @@ layout(std140) uniform ClodScan {
 layout(location = 0) in vec2 texCoord;
 layout(location = 0) out vec4 fragColor;
 
-const float GEOMETRY_DEPTH = 1.0e-6;
+// 26.3 device depth: d = near/eyeZ (infinite far) — sky == 0.0.
+const float SKY_DEPTH = 1.0e-6;
 
 void main() {
     float depth = texture(InDepthSampler, texCoord).r;
     vec3 col = texture(InSampler, texCoord).rgb;
 
-    // 26.3 device depth (live-verified): d = near/eyeZ, infinite far plane —
-    // the sky sits at EXACTLY 0.0; any real geometry reads positive values.
-    // Sky pixels only: real geometry (and the LOD we draw later) never
-    // writes to the far plane.
-    if (depth > GEOMETRY_DEPTH) {
+    // Sky pixels only: real geometry never writes to the far plane.
+    if (depth > SKY_DEPTH) {
         fragColor = vec4(0.0);
         return;
     }
 
-    // Day fraction: GameTime is ticks/24000 (+ partial tick), fract() handles
-    // both absolute-tick and day-fraction interpretations.
+    // Day fraction: GameTime = (ticks % 24000 + partial) / 24000.
     float t = fract(GameTime) * 6.28318530718;
     vec3 sunDir = vec3(cos(t), sin(t), 0.0);
 
     float luma = dot(col, vec3(0.2126, 0.7152, 0.0722));
+    float w = 0.0;
 
-    // Below horizon or heavily overcast: nothing to track this frame.
-    float weight = 0.0;
     if (sunDir.y >= -0.12) {
-        // DAY: the sun quad is warm (red > blue). Clouds are neutral and
-        // washed out — the warmth^2 * luma^2 kernel suppresses them.
-        float warmth = max(0.0, col.r - max(col.g, col.b) * 0.92);
-        warmth = max(warmth, 0.004) * step(0.004, warmth);
-        weight = luma * luma * warmth * warmth * 4096.0;
+        // DAY: yellow disc on a blue/white sky.
+        float yellow = min(col.r, col.g) - col.b;
+        w = clamp(yellow * 1.7, 0.0, 1.0) * smoothstep(0.30, 0.70, luma);
     } else {
-        // NIGHT: track the moon (opposite the sun, neutral white, dominant).
-        weight = max(0.0, luma - 0.55) * max(0.0, luma - 0.55) * 256.0
-                 * step(col.b + 0.02, col.r + 0.08);
+        // NIGHT: blue-white moon disc on a dark sky.
+        float blue = col.b - max(col.r, col.g);
+        w = clamp(blue * 3.0, 0.0, 1.0) * smoothstep(0.22, 0.55, luma);
     }
 
-    // Confidence gate: a lone bright pixel (star, glint) must not steer the
-    // tracker; the reduce pass thresholds on the total weight anyway.
-    if (weight < ScanParams.y) {
-        weight = 0.0;
+    // Noise gate (0..1 units: a lone star or a glint must not steer us).
+    if (w < ScanParams.y) {
+        w = 0.0;
     }
 
-    fragColor = vec4(weight, gl_FragCoord.x / OutSize.x, gl_FragCoord.y / OutSize.y, 1.0);
+    fragColor = vec4(w, gl_FragCoord.x / OutSize.x, gl_FragCoord.y / OutSize.y, 1.0);
 }

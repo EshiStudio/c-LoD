@@ -2,7 +2,10 @@
 #extension GL_ARB_separate_shader_objects : require
 
 // c-LoD pass 2: reduce the 256x256 sun-candidate field to 16x16 tiles.
-// Each output texel = (sum w, sum w*u, sum w*v, 1) over its 16x16 tile.
+// Each output texel = the MEAN of (w, w*u, w*v) over its 16x16 tile.
+//
+// Means, not sums: post-chain targets are 8-bit and a sum of 256 weights
+// would saturate at 1.0, destroying the magnitude the solver thresholds on.
 
 uniform sampler2D ScanSampler; // clod:clod_scan (256x256)
 
@@ -29,5 +32,6 @@ void main() {
             sv += s.r * s.b;
         }
     }
-    fragColor = vec4(sw, su, sv, 1.0);
+    const float N = 256.0;
+    fragColor = vec4(sw / N, su / N, sv / N, 1.0);
 }

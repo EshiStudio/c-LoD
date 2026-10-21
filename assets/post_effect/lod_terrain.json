@@ -45,11 +45,21 @@
         },
         {
             "vertex_shader": "minecraft:core/screenquad",
-            "fragment_shader": "clod:post/rot_copy",
+            "fragment_shader": "clod:post/pose_solve",
             "inputs": [
-                { "sampler_name": "In", "target": "clod_rot_b" }
+                { "sampler_name": "Prev", "target": "clod_rot_b" },
+                { "sampler_name": "InDepth", "target": "minecraft:main", "use_depth_buffer": true },
+                { "sampler_name": "Atlas", "location": "clod:atlas", "width": __ATLAS_CELLS__, "height": __ATLAS_CELLS__, "bilinear": true }
             ],
-            "output": "clod_rot_a"
+            "output": "clod_rot_a",
+            "uniforms": {
+                "ClodPose": [
+                    { "name": "PoseParams", "type": "vec4", "value": [__FOV__, __DEPTH_NEAR__, __MAX_HEIGHT__, __SEA_LEVEL__] }
+                ],
+                "ClodAtlas": [
+                    { "name": "AtlasInfo", "type": "vec4", "value": [__ORIGIN_X__, __ORIGIN_Z__, __ATLAS_SIZE__, __CELL__] }
+                ]
+            }
         },
         {
             "vertex_shader": "minecraft:core/screenquad",
@@ -57,7 +67,7 @@
             "inputs": [
                 { "sampler_name": "In", "target": "minecraft:main" },
                 { "sampler_name": "InDepth", "target": "minecraft:main", "use_depth_buffer": true },
-                { "sampler_name": "Atlas", "location": "clod:effect/atlas", "width": __ATLAS_CELLS__, "height": __ATLAS_CELLS__, "bilinear": true },
+                { "sampler_name": "Atlas", "location": "clod:atlas", "width": __ATLAS_CELLS__, "height": __ATLAS_CELLS__, "bilinear": true },
                 { "sampler_name": "Rot", "target": "clod_rot_a" }
             ],
             "output": "clod_swap",
@@ -67,6 +77,9 @@
                 ],
                 "ClodParams": [
                     { "name": "LodParams", "type": "vec4", "value": [__LOD_NEAR__, __MAX_HEIGHT__, __SEA_LEVEL__, __MIN_CONF__] }
+                ],
+                "ClodDebug": [
+                    { "name": "DebugParams", "type": "vec4", "value": [__DEBUG__, 0.0, 0.0, 0.0] }
                 ],
                 "ClodFog": [
                     { "name": "FogParams", "type": "vec4", "value": [__FOG_START__, __FOG_END__, __FOV__, 0.0] }

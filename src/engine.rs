@@ -54,6 +54,8 @@ pub struct State {
     /// When the atlas world was first resolved (scan deadline anchor).
     pub world_seen_at: Mutex<Option<std::time::Instant>>,
     pub scan_seq: AtomicU64,
+    /// Chunk-major streaming cursor (index into the atlas chunk grid).
+    pub scan_cursor: AtomicU64,
     pub world_obj: Mutex<usize>, // jobject handle as usize; main-thread only
     pub world_name: Mutex<String>,
     pub keys: Mutex<Option<Keys>>,
@@ -87,6 +89,12 @@ pub struct PlayerState {
     pub resends: u32,
     /// Last applied tier (0=Off, 1=Veil, 2=Full) for change logging.
     pub last_tier: u8,
+    /// Remaining ticks of the post-pack "kick": the client drops effect ids
+    /// that arrive before the pack is applied (push/reload race) and
+    /// `PlayerPostEffects.update()` is a wire no-op when the list is
+    /// unchanged, so the only reliable way to make it re-resolve is a real
+    /// remove+add cycle. While `kick > 0` the list is cycled once per second.
+    pub kick: u32,
 }
 
 /// Per-player LOD tier, re-evaluated every tick. Switching tiers is pure
@@ -148,6 +156,7 @@ impl State {
             warmed: AtomicU8::new(0),
             world_seen_at: Mutex::new(None),
             scan_seq: AtomicU64::new(0),
+            scan_cursor: AtomicU64::new(0),
             world_obj: Mutex::new(0),
             world_name: Mutex::new(String::new()),
             keys: Mutex::new(None),
@@ -317,24 +326,37 @@ fn scan_batch(state: &Arc<State>, env: Env) {
     }
     let world = unsafe { as_obj(world_handle) };
     let seq = state.scan_seq.fetch_add(1, Ordering::Relaxed);
-    let budget = state.cfg.scan_budget;
-    // Advance the sweep by `budget` cells per tick (scan_task wraps the
-    // start index over the whole atlas): passing the bare tick number made
-    // every tick rescan cells 0..budget+bumped-by-one, leaving most of the
-    // atlas (and the warm core) unreached until the deadline fired.
-    let tasks = state.atlas.scan_task(seq * budget as u64, budget);
-    for (ix, iz) in tasks.iter().copied() {
-        let x = state.atlas.cell_world_x(ix);
-        let z = state.atlas.cell_world_z(iz);
-        if let Some((y, liquid)) = jni::sample_height(env, world, x, z) {
-            state.atlas.set(ix, iz, (y.clamp(-64, 1023)) as i16, liquid);
+    if state.cfg.stream_chunks > 0 {
+        // Chunk-major streaming: generate -> sample -> release, N chunks/tick.
+        // This is what lets the atlas span kilometres: resident chunks stay
+        // bounded instead of pinning (2*w+1)^2 force-loaded chunks.
+        scan_stream(state, env, world);
+    } else {
+        let budget = state.cfg.scan_budget;
+        // Advance the sweep by `budget` cells per tick (scan_task wraps the
+        // start index over the whole atlas): passing the bare tick number made
+        // every tick rescan cells 0..budget+bumped-by-one, leaving most of the
+        // atlas (and the warm core) unreached until the deadline fired.
+        let tasks = state.atlas.scan_task(seq * budget as u64, budget);
+        for (ix, iz) in tasks.iter().copied() {
+            let x = state.atlas.cell_world_x(ix);
+            let z = state.atlas.cell_world_z(iz);
+            if let Some((y, liquid)) = jni::sample_height(env, world, x, z) {
+                state.atlas.set(ix, iz, (y.clamp(-64, 1023)) as i16, liquid);
+            }
         }
     }
     // Rate-limited scan diagnostics (one line per 25 ticks).
     if seq.is_multiple_of(25) {
         use std::sync::atomic::Ordering as O;
+        let streamed = if state.cfg.stream_chunks > 0 {
+            let (done, total) = stream_progress(&state.atlas);
+            format!(" chunks {done}/{total}")
+        } else {
+            String::new()
+        };
         crate::log_info(&format!(
-            "scan: tick {seq}, atlas v{} ({}/{} cells), ok={} unloaded={} err={}",
+            "scan: tick {seq}, atlas v{} ({}/{} cells{streamed}), ok={} unloaded={} err={}",
             state.atlas.version(),
             state.atlas.scanned_cells(),
             state.atlas.total_cells(),
@@ -342,6 +364,69 @@ fn scan_batch(state: &Arc<State>, env: Env) {
             jni::SCAN_UNLOADED.load(O::Relaxed),
             jni::SCAN_ERR.load(O::Relaxed),
         ));
+    }
+}
+
+/// Chunk grid of the atlas: (side in chunks, first chunk X, first chunk Z).
+fn chunk_grid(atlas: &Atlas) -> (i32, i32, i32) {
+    let side = (atlas.size / 16).max(1);
+    let half = atlas.size / 2;
+    (
+        side,
+        (atlas.center_x - half).div_euclid(16),
+        (atlas.center_z - half).div_euclid(16),
+    )
+}
+
+fn stream_progress(atlas: &Atlas) -> (u64, u64) {
+    let (side, _, _) = chunk_grid(atlas);
+    let total = (side as u64) * (side as u64);
+    (CURSOR_HINT.load(Ordering::Relaxed).min(total), total)
+}
+
+/// Last streaming cursor value (progress display only).
+static CURSOR_HINT: AtomicU64 = AtomicU64::new(0);
+
+/// Streamed chunk-major scan pass: exactly `stream_chunks` chunks per tick,
+/// each force-loaded (which generates it), sampled at cell resolution and
+/// un-forced immediately. The cursor is monotonic over the atlas chunk grid,
+/// so the whole atlas is covered exactly once and `scanned >= total` fires
+/// the normal finalize path as soon as the last chunk is written.
+fn scan_stream(state: &Arc<State>, env: Env, world: jvmti_bindings::jni::jobject) {
+    let atlas = &state.atlas;
+    let cell = atlas.cell.max(1);
+    let (side, cx0, cz0) = chunk_grid(atlas);
+    let total = (side as u64) * (side as u64);
+    let per = (16 / cell).max(1); // cells per chunk edge
+    let half = atlas.size / 2;
+    let budget = state.cfg.stream_chunks.max(1);
+
+    for _ in 0..budget {
+        let idx = state.scan_cursor.fetch_add(1, Ordering::Relaxed);
+        if idx >= total {
+            break;
+        }
+        CURSOR_HINT.store(idx + 1, Ordering::Relaxed);
+        let cx = cx0 + (idx % side as u64) as i32;
+        let cz = cz0 + (idx / side as u64) as i32;
+        if !jni::warm_chunk(env, world, cx, cz, true) {
+            continue;
+        }
+        for dz in 0..per {
+            for dx in 0..per {
+                let x = cx * 16 + dx * cell + cell / 2;
+                let z = cz * 16 + dz * cell + cell / 2;
+                let ix = (x - (atlas.center_x - half)) / cell;
+                let iz = (z - (atlas.center_z - half)) / cell;
+                if ix < 0 || iz < 0 || ix as u32 >= atlas.cells || iz as u32 >= atlas.cells {
+                    continue;
+                }
+                if let Some((y, liquid)) = jni::sample_height(env, world, x, z) {
+                    atlas.set(ix as u32, iz as u32, (y.clamp(-64, 1023)) as i16, liquid);
+                }
+            }
+        }
+        let _ = jni::warm_chunk(env, world, cx, cz, false);
     }
 }
 
@@ -398,11 +483,15 @@ fn manage_players(state: &Arc<State>, env: Env) {
                             &url,
                             &pack.sha1,
                             &state.cfg.pack_prompt,
-                            false,
+                            state.cfg.pack_force,
                         );
                         if ok {
                             st.pushed_sha = pack.sha1_hex.clone();
                             st.resends = 0;
+                            // 30 s of one-per-second effect-list kicks: the
+                            // pack download+reload on the client is slower
+                            // than the first post-effect packet.
+                            st.kick = 600;
                             crate::log_info(&format!(
                                 "pack pushed to {} ({}): {} bytes, sha1 {}",
                                 p.uuid,
@@ -461,6 +550,20 @@ fn manage_players(state: &Arc<State>, env: Env) {
         }
         let have_pack = pack.is_some();
         if let Some(handle) = jni::player_by_uuid(env, &p.uuid) {
+            // Kick window: force a fresh remove+add once per second so a
+            // client that resolved the ids too early (before its resource
+            // reload finished) gets a second chance — repeatedly.
+            if st.kick > 0 && state.tick_no.load(Ordering::Relaxed).is_multiple_of(20) {
+                st.kick = st.kick.saturating_sub(20);
+                if st.terrain_on {
+                    let _ = jni::remove_effect(env, handle, unsafe { as_obj(keys.terrain) });
+                    st.terrain_on = false;
+                }
+                if st.atmosphere_on {
+                    let _ = jni::remove_effect(env, handle, unsafe { as_obj(keys.atmosphere) });
+                    st.atmosphere_on = false;
+                }
+            }
             let want_terrain = have_pack && tier == Tier::Full && keys.terrain != 0;
             let want_atmo =
                 have_pack && (tier == Tier::Full || tier == Tier::Veil) && keys.atmosphere != 0;

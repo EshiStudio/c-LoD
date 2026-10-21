@@ -72,33 +72,20 @@ void main() {
     float tanH = tan(radians(fov) * 0.5);
     float aspect = OutSize.x / max(OutSize.y, 1.0);
 
-    // Find the strongest tile, then use a 3x3 neighborhood around it so the
-    // centroid covers the whole disc, not a clipped tile.
-    float best = 0.0;
-    ivec2 bestTile = ivec2(0);
-    for (int y = 0; y < 16; ++y) {
-        for (int x = 0; x < 16; ++x) {
-            float w = texelFetch(SmallSampler, ivec2(x, y), 0).r;
-            if (w > best) {
-                best = w;
-                bestTile = ivec2(x, y);
-            }
-        }
-    }
-
+    // Sum every tile: the sun is the only yellow object in the sky, so the
+    // global centroid is the disc centre (a 3x3 window around the brightest
+    // tile biased the estimate toward that tile). Tile texels hold the MEAN
+    // of (w, w*u, w*v) over 16x16 pixels, so the sums stay well inside 0..1
+    // per texel and `meas = su/sw` is a proper screen position.
     float sw = 0.0;
     float su = 0.0;
     float sv = 0.0;
-    for (int y = -1; y <= 1; ++y) {
-        for (int x = -1; x <= 1; ++x) {
-            ivec2 t = bestTile + ivec2(x, y);
-            if (any(lessThan(t, ivec2(0))) || any(greaterThanEqual(t, ivec2(16)))) {
-                continue;
-            }
-            vec4 s = texelFetch(SmallSampler, t, 0);
+    for (int y = 0; y < 16; ++y) {
+        for (int x = 0; x < 16; ++x) {
+            vec4 s = texelFetch(SmallSampler, ivec2(x, y), 0);
             sw += s.r;
-            su += s.r * s.g;
-            sv += s.r * s.b;
+            su += s.g;
+            sv += s.b;
         }
     }
 
@@ -107,7 +94,7 @@ void main() {
     float prevEl = prev.g * PI - PI * 0.5;
     float prevConf = prev.b;
 
-    vec4 outRot = vec4(prev.r, prev.g, prevConf * 0.99, 1.0);
+    vec4 outRot = vec4(prev.r, prev.g, prevConf * 0.9985, prev.a);
 
     if (sw >= wThresh) {
         vec2 meas = vec2(su / sw, sv / sw);
@@ -148,7 +135,7 @@ void main() {
         float mixedEl = mix(prevEl, el, blend);
         float conf = min(1.0, max(prevConf, 0.4) + 0.1);
 
-        outRot = vec4(mixedAz / 6.28318530718, (mixedEl + PI * 0.5) / PI, conf, 1.0);
+        outRot = vec4(mixedAz / 6.28318530718, (mixedEl + PI * 0.5) / PI, conf, prev.a);
     }
 
     fragColor = outRot;

@@ -65,13 +65,17 @@ pub fn build(cfg: &Config, atlas: &Atlas) -> Pack {
 
     let origin_x = atlas.center_x - atlas.half();
     let origin_z = atlas.center_z - atlas.half();
-    // 26.3 veil window in EYE-SPACE BLOCKS (the shader converts device depth
-    // via eyeZ = depth_near / d): the veil starts taking over just before the
-    // LOD band begins and reaches full strength at `veil_far`.
+    // Upstream v4.0.0: the veil window is expressed in EYE-SPACE BLOCKS (the
+    // shader converts device depth via eyeZ = depth_near / d), so it starts
+    // just before the LOD band and reaches full strength at `veil_far`.
     let atmo_start = fmt_f(cfg.lod_near * 0.85);
     let atmo_end = fmt_f(cfg.veil_far);
     let fog_start = cfg.lod_near * 1.05;
-    let fog_end = atlas.size as f32 * 0.72;
+    // Local tweak: the default (size * 0.72) sat past the atlas border for
+    // half-extent <= 0.72*size, so the scanned window's square edge was
+    // only ~65% veiled and showed up as a hard wall on the horizon.
+    // Fade fully before the border instead.
+    let fog_end = (atlas.size as f32 * 0.72).min(atlas.half() as f32 * 0.92);
 
     let veil_rgba = [
         cfg.color_veil[0],
@@ -84,7 +88,11 @@ pub fn build(cfg: &Config, atlas: &Atlas) -> Pack {
         ("__FOV__", fmt_f(cfg.fov)),
         ("__SCAN_THRESH__", fmt_f(cfg.sun_threshold)),
         ("__ROT_BLEND__", fmt_f(cfg.rot_blend)),
-        ("__SOLVE_THRESH__", fmt_f(cfg.sun_threshold * 220.0)),
+        // The solve pass sums the 16x16 tile MEANS of the sun weight (each in
+        // 0..1), so a locked sun yields ~5..15 while empty sky stays well under
+        // 0.1. Post-chain targets are 8-bit, so the old `* 220` (weight sums
+        // that saturated) could never be reached.
+        ("__SOLVE_THRESH__", fmt_f(cfg.sun_threshold * 2.0)),
         ("__ORIGIN_X__", fmt_f(origin_x as f32)),
         ("__ORIGIN_Z__", fmt_f(origin_z as f32)),
         ("__ATLAS_SIZE__", fmt_f(atlas.size as f32)),
@@ -103,9 +111,14 @@ pub fn build(cfg: &Config, atlas: &Atlas) -> Pack {
         ("__COL_HIGH__", rgba(cfg.color_high)),
         ("__COL_WATER__", rgba(cfg.color_water)),
         ("__VEIL_RGBA__", vec4(veil_rgba)),
+        ("__DEBUG__", format!("{}.0", cfg.debug_lod)),
         ("__ATMO_START__", atmo_start),
         ("__ATMO_END__", atmo_end),
-        ("__ATMO_STRENGTH__", fmt_f(0.92)),
+        // The distance veil is disabled (strength 0): it sits on real geometry
+        // only, but a strength > 0 also tints distant clouds and the chunk
+        // wall; LOD fog already handles the horizon, and the veil must never
+        // starve the sun tracker.
+        ("__ATMO_STRENGTH__", fmt_f(0.0)),
         // 26.3 device depth: d = depth_near / eyeZ (infinite far, sky == 0.0).
         ("__DEPTH_NEAR__", fmt_f(cfg.depth_near)),
     ];
@@ -116,18 +129,26 @@ pub fn build(cfg: &Config, atlas: &Atlas) -> Pack {
     let sun_scan = include_str!("../assets/glsl/sun_scan.fsh");
     let sun_reduce = include_str!("../assets/glsl/sun_reduce.fsh");
     let sun_solve = include_str!("../assets/glsl/sun_solve.fsh");
-    let rot_copy = include_str!("../assets/glsl/rot_copy.fsh");
+    let pose_solve = include_str!("../assets/glsl/pose_solve.fsh");
     let lod_terrain = include_str!("../assets/glsl/lod_terrain.fsh");
     let clod_blit = include_str!("../assets/glsl/clod_blit.fsh");
     let atmosphere = include_str!("../assets/glsl/atmosphere.fsh");
 
-    // 26.3 pack.mcmeta schema (verified against vanilla embedded packs and
-    // PackFormat$IntermediaryFormat): packs declaring a format newer than 64
-    // MUST carry min_format/max_format; the legacy pack_format key is what
-    // triggered the client warning "missing mandatory fields min_format and
-    // max_format" (ResourceMetadata fallback). 97 = resource_major of 26.3
-    // (client version.json: resource_major 97, resource_minor 1).
-    let mcmeta = "{\"pack\":{\"description\":\"c-LoD v3 static LOD terrain (posteffect + heightfield raymarch)\",\"min_format\":97,\"max_format\":97}}".to_string();
+    // 26.3 moved resource packs to the major.minor scheme (26.3 = 97.1) and
+    // REJECTS a bare `pack_format` when it is newer than 64:
+    //   "Pack declares support for version newer than 64, but is missing
+    //    mandatory fields min_format and max_format"
+    // `PackFormat` is decoded with `compactListCodec(INT, INT.listOf())`, so
+    // `[major, minor]` is the canonical form. Without this the client refuses
+    // the pack and every `clod:*` post effect stays "does not exist".
+    let mcmeta = concat!(
+        "{\"pack\":{",
+        "\"description\":\"c-LoD v3 static LOD terrain (posteffect + heightfield raymarch)\",",
+        "\"min_format\":[97,0],",
+        "\"max_format\":[97,1]",
+        "}}"
+    )
+    .to_string();
 
     let (aw, ah, atlas_rgba) = atlas.encode_rgba();
     let atlas_png = png::encode_png(aw, ah, &atlas_rgba);
@@ -151,7 +172,10 @@ pub fn build(cfg: &Config, atlas: &Atlas) -> Pack {
         "assets/clod/shaders/post/sun_solve.fsh",
         sun_solve.as_bytes(),
     );
-    zip.add("assets/clod/shaders/post/rot_copy.fsh", rot_copy.as_bytes());
+    zip.add(
+        "assets/clod/shaders/post/pose_solve.fsh",
+        pose_solve.as_bytes(),
+    );
     zip.add(
         "assets/clod/shaders/post/lod_terrain.fsh",
         lod_terrain.as_bytes(),
@@ -217,36 +241,23 @@ mod tests {
     }
 
     #[test]
-    fn mcmeta_uses_26_3_new_format_schema() {
-        // Client 26.3 refuses legacy-only mcmeta for formats > 64 ("missing
-        // mandatory fields min_format and max_format"). The pack must follow
-        // the vanilla-26.3 schema: min_format/max_format, no legacy key.
+    fn mcmeta_declares_the_26_3_minor_range() {
+        // 26.3 rejects a bare `pack_format` > 64 ("missing mandatory fields
+        // min_format and max_format"): the whole pack — post-effect chains
+        // included — is then never registered by the client.
         let cfg = Config::parse("");
-        let atlas = Atlas::new(0, 0, 256, 4, 63);
+        let atlas = Atlas::new(
+            cfg.center_x,
+            cfg.center_z,
+            cfg.atlas_size,
+            cfg.cell_size,
+            cfg.sea_level,
+        );
         let pack = build(&cfg, &atlas);
-        let start = pack
-            .zip
-            .windows(4)
-            .position(|w| w == [0x50, 0x4b, 0x03, 0x04])
-            .expect("local file header");
-        // First entry is pack.mcmeta (STORE) — find its data right after the header.
-        let name_len = u16::from_le_bytes([pack.zip[start + 26], pack.zip[start + 27]]) as usize;
-        let extra_len = u16::from_le_bytes([pack.zip[start + 28], pack.zip[start + 29]]) as usize;
-        let size = u32::from_le_bytes([
-            pack.zip[start + 18],
-            pack.zip[start + 19],
-            pack.zip[start + 20],
-            pack.zip[start + 21],
-        ]) as usize;
-        let mcmeta = String::from_utf8_lossy(
-            &pack.zip[start + 30 + name_len + extra_len..start + 30 + name_len + extra_len + size],
-        );
-        assert!(mcmeta.contains("\"min_format\":97"), "mcmeta: {mcmeta}");
-        assert!(mcmeta.contains("\"max_format\":97"), "mcmeta: {mcmeta}");
-        assert!(
-            !mcmeta.contains("pack_format"),
-            "legacy key must go: {mcmeta}"
-        );
+        let s = String::from_utf8_lossy(&pack.zip);
+        assert!(s.contains("\"min_format\":[97,0]"), "min_format missing");
+        assert!(s.contains("\"max_format\":[97,1]"), "max_format missing");
+        assert!(!s.contains("\"pack_format\""), "legacy pack_format kept");
     }
 
     #[test]
@@ -277,3 +288,4 @@ mod tests {
         assert_eq!(fmt_f(0.25), "0.25");
     }
 }
+
