@@ -139,8 +139,7 @@ mod tests {
         let mut p = 8usize; // after signature
         let mut seen = Vec::new();
         while p + 8 <= png.len() {
-            let len =
-                u32::from_be_bytes([png[p], png[p + 1], png[p + 2], png[p + 3]]) as usize;
+            let len = u32::from_be_bytes([png[p], png[p + 1], png[p + 2], png[p + 3]]) as usize;
             let kind = &png[p + 4..p + 8];
             let data = &png[p + 8..p + 8 + len];
             seen.push((String::from_utf8_lossy(kind).to_string(), len));

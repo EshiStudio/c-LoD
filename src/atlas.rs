@@ -40,6 +40,44 @@ pub struct Cell {
     pub valid: bool,
 }
 
+/// Fill every invalid cell with the value of its nearest valid cell
+/// (multi-source BFS over the 4-neighbourhood, row-major seed order, so the
+/// result is deterministic). No-op when nothing is valid.
+fn fill_holes(cells: &mut [Cell], n: usize) {
+    if n == 0 || cells.len() != n * n {
+        return;
+    }
+    let mut queue: std::collections::VecDeque<usize> = cells
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.valid)
+        .map(|(i, _)| i)
+        .collect();
+    while let Some(i) = queue.pop_front() {
+        let src = cells[i];
+        let (x, z) = (i % n, i / n);
+        let mut visit = |nx: usize, nz: usize| {
+            let j = nz * n + nx;
+            if !cells[j].valid {
+                cells[j] = src;
+                queue.push_back(j);
+            }
+        };
+        if x > 0 {
+            visit(x - 1, z);
+        }
+        if x + 1 < n {
+            visit(x + 1, z);
+        }
+        if z > 0 {
+            visit(x, z - 1);
+        }
+        if z + 1 < n {
+            visit(x, z + 1);
+        }
+    }
+}
+
 impl Atlas {
     pub fn new(center_x: i32, center_z: i32, size: i32, cell: i32, sea_level: i32) -> Self {
         let cells = (size / cell).max(1) as u32;
@@ -147,11 +185,16 @@ impl Atlas {
     /// Encode the atlas as RGBA8 pixels for the PNG texture:
     ///   R = high byte, G = low byte of `(height + 64) << 6`,
     ///   B = 255 when water, A = 255 (opaque).
-    /// Unscanned cells encode height 0 / water so the shader treats them as
-    /// void (below the culled minimum).
+    /// Unscanned cells (chunks that were never loaded before the scan
+    /// deadline) are filled from the nearest scanned cell, see
+    /// [`fill_holes`]. Leaving them as a "void" height made the shader's
+    /// filtered lookup ramp down to the void and draw spiky curtains and
+    /// empty bands around every hole. Only an atlas with no scanned cell at
+    /// all keeps the void encoding.
     pub fn encode_rgba(&self) -> (u32, u32, Vec<u8>) {
-        let snap = self.snapshot();
+        let mut snap = self.snapshot();
         let n = self.cells as usize;
+        fill_holes(&mut snap, n);
         let mut px = vec![0u8; n * n * 4];
         for z in 0..n {
             for x in 0..n {
@@ -317,10 +360,16 @@ mod tests {
         let o2 = 0;
         assert_eq!(px[o2], ((62 + 64) << 6 >> 8) as u8);
         assert_eq!(px[o2 + 2], 255);
-        // invalid -> zero
+        // unscanned cells are filled from a scanned neighbour, never left void
         let o3 = (7 * 16 + 7) * 4;
-        assert_eq!(px[o3], 0);
-        assert_eq!(px[o3 + 2], 0);
+        assert_ne!((px[o3], px[o3 + 1]), (0, 0));
+    }
+
+    #[test]
+    fn fully_unscanned_atlas_stays_void() {
+        let a = Atlas::new(0, 0, 16, 4, 63);
+        let (_, _, px) = a.encode_rgba();
+        assert!(px.chunks(4).all(|c| c[0] == 0 && c[1] == 0 && c[2] == 0));
     }
 
     #[test]
@@ -391,5 +440,25 @@ mod tests {
         let mut truncated = bytes.clone();
         truncated.truncate(bytes.len() - 7);
         assert!(Atlas::from_bytes(&truncated, 0, 0, 64, 4, 63).is_none());
+    }
+
+    #[test]
+    fn holes_are_filled_from_nearest_scanned_cell() {
+        let a = Atlas::new(0, 0, 16, 4, 63); // 4x4 cells
+        a.set(0, 0, 80, false);
+        a.set(3, 3, 40, true);
+        let (_, _, px) = a.encode_rgba();
+        let decode = |x: usize, z: usize| {
+            let o = (z * 4 + x) * 4;
+            let y16 = (u32::from(px[o]) << 8) | u32::from(px[o + 1]);
+            (y16 as i32 >> 6) - 64
+        };
+        assert_eq!(decode(1, 0), 80, "next to the first sample");
+        assert_eq!(decode(3, 2), 40, "next to the second sample");
+        assert_eq!(px[(3 * 4 + 2) * 4 + 2], 255, "water flag is copied too");
+        assert!(
+            (0..16).all(|i| px[i * 4 + 1] != 0 || px[i * 4] != 0),
+            "no void cell may remain once anything was scanned"
+        );
     }
 }

@@ -69,14 +69,34 @@ const int MAX_STEPS = 420;
 const int BISECT = 7;
 
 // Height (block Y) stored in the atlas: (y + 64) << 6, big-endian RG.
-float atlas_height(vec2 uv) {
-    vec4 a = texture(AtlasSampler, uv);
-    float y16 = a.r * 65280.0 + a.g * 255.0; // r*255*256 + g*255
+// The two bytes are NOT a linear quantity: hardware bilinear filtering mixes
+// the high and low bytes independently and invents spikes ("curtains") at
+// every byte rollover and next to void cells. So the atlas is sampled with
+// texelFetch, each texel is decoded to a height first, and only then blended.
+float atlas_texel_height(ivec2 p) {
+    vec4 a = texelFetch(AtlasSampler, p, 0);
+    float y16 = floor(a.r * 255.0 + 0.5) * 256.0 + floor(a.g * 255.0 + 0.5);
     return y16 / 64.0 - 64.0;
 }
 
+float atlas_height(vec2 uv) {
+    ivec2 n = textureSize(AtlasSampler, 0);
+    vec2 f = uv * vec2(n) - 0.5;
+    ivec2 i0 = ivec2(floor(f));
+    vec2 w = f - vec2(i0);
+    ivec2 lo = ivec2(0);
+    ivec2 hi = n - 1;
+    float h00 = atlas_texel_height(clamp(i0, lo, hi));
+    float h10 = atlas_texel_height(clamp(i0 + ivec2(1, 0), lo, hi));
+    float h01 = atlas_texel_height(clamp(i0 + ivec2(0, 1), lo, hi));
+    float h11 = atlas_texel_height(clamp(i0 + ivec2(1, 1), lo, hi));
+    return mix(mix(h00, h10, w.x), mix(h01, h11, w.x), w.y);
+}
+
 bool atlas_water(vec2 uv) {
-    return texture(AtlasSampler, uv).b > 0.5;
+    ivec2 n = textureSize(AtlasSampler, 0);
+    ivec2 p = clamp(ivec2(floor(uv * vec2(n))), ivec2(0), n - 1);
+    return texelFetch(AtlasSampler, p, 0).b > 0.5;
 }
 
 // Heightfield lookup in world space; clamps to the atlas edge (plateau).
@@ -236,7 +256,7 @@ void main() {
     // field is free; starting at 0 also guarantees the first sample is above
     // the heightfield (the camera always is), which the crossing test needs.
     float t = 0.0;
-    float dt = max(cell * 0.75, t * 0.004);
+    float dt = max(cell * 0.75, t * 0.008);
     float tHit = -1.0;
     float prevT = t;
     float prevDiff = 1.0e9;
@@ -248,9 +268,9 @@ void main() {
         prevT = t;
         prevDiff = above;
         t = min(t + dt, size);
-        // Grow the step so ~420 iterations cover the full atlas (was: constant
-        // 2 blocks, which capped the march at ~720 of 2048 blocks).
-        dt = max(cell * 0.75, t * 0.004);
+        // Grow the step so ~420 iterations cover the full atlas (0.004 only
+        // reached ~1500 blocks of a 4096 atlas; 0.008 reaches ~3900).
+        dt = max(cell * 0.75, t * 0.008);
 
         xz = cam.xz + dir.xz * t;
         // Left the atlas? No LOD here.
