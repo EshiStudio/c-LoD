@@ -2,21 +2,23 @@
 #extension GL_ARB_separate_shader_objects : require
 #include <minecraft:globals.glsl>
 
-// c-LoD pass 5: the actual level-of-distant-detail renderer.
+// c-LoD pass 4: the actual level-of-distant-detail renderer.
 //
 // For every pixel that shows sky (device depth ~ 1) we march a view ray
 // against the heightfield atlas shipped in the server resource pack and
-// shade the hit. The ray is built from the camera basis recovered by the
-// sun tracker (clod_rot target) and the configured FOV. Camera position
-// comes from the Globals UBO (CameraBlockPos + CameraOffset), which the
-// engine binds to every post pass — verified against vanilla box_blur.fsh.
+// shade the hit. The ray is built from the camera basis delivered by the
+// CAMERA CHANNEL (v4.1): the sky shader encodes yaw/pitch/fov into the
+// alpha of the leftmost columns, col_scan + rot_solve decode it into the
+// clod_rot target. Works at any time of day and any camera orientation —
+// no sun in view required. Camera position comes from the Globals UBO
+// (CameraBlockPos + CameraOffset), bound to every post pass.
 //
 // Non-sky pixels pass through untouched: real chunks always win.
 
 uniform sampler2D InSampler;      // minecraft:main color
 uniform sampler2D InDepthSampler; // minecraft:main depth
 uniform sampler2D AtlasSampler;   // clod:textures/effect/atlas.png (RG = height, B = water)
-uniform sampler2D RotSampler;     // clod:clod_rot_a (1x1 persistent)
+uniform sampler2D RotSampler;     // clod:clod_rot_a (1x1 persistent, camera channel)
 
 layout(std140) uniform SamplerInfo {
     vec2 OutSize;
@@ -33,14 +35,20 @@ layout(std140) uniform ClodParams {
     vec4 LodParams;
 };
 
-// x = fog start (blocks), y = fog end (blocks), z = fov (deg), w = unused
-// x = debug mode (0 = normal, 1 = paint confidence into the sky)
+// x = fog start (blocks), y = fog end (blocks), z = static fov fallback, w = unused
+layout(std140) uniform ClodFog {
+    vec4 FogParams;
+};
+
+// x = debug mode (0 = normal, 1 = confidence heat, 2 = split, 3 = pattern,
+// 4 = hit mask, 5 = hit distance)
 layout(std140) uniform ClodDebug {
     vec4 DebugParams;
 };
 
-layout(std140) uniform ClodFog {
-    vec4 FogParams;
+// x = device depth near plane (blocks), y = cloud ceiling (atlas max + margin)
+layout(std140) uniform ClodSky {
+    vec4 SkyParams;
 };
 
 layout(std140) uniform ClodColors {
@@ -105,10 +113,7 @@ void main() {
         return;
     }
 
-    if (depth > SKY_DEPTH) {
-        fragColor = scene;
-        return;
-    }
+    bool skyPix = depth <= SKY_DEPTH;
     vec4 rot = texelFetch(RotSampler, ivec2(0), 0);
     float conf = rot.b;
     float minConf = LodParams.w;
@@ -160,6 +165,9 @@ void main() {
         return;
     }
 
+    // v4.0 encoding preserved: R = az/2pi, G = (el+pi/2)/pi, B = conf.
+    // A = fov byte (new in v4.1): the REAL vertical fov measured by the sky
+    // shader from ProjMat[1][1] — spyglass zoom and fov options just work.
     float az = rot.r * 6.28318530718;
     float el = rot.g * PI - PI * 0.5;
 
@@ -167,10 +175,10 @@ void main() {
     vec3 R = vec3(-sin(az), 0.0, cos(az));
     vec3 U = vec3(-cos(az) * sin(el), cos(el), -sin(az) * sin(el));
 
-    // FOV from the pose tracker (estimated from the depth buffer, follows the
-    // client's real slider and its dynamic sprint/fly offset), pack value as
-    // the fallback before the first lock.
-    float fov = rot.a > 0.02 ? 30.0 + rot.a * 80.0 : FogParams.z;
+    // v4.1 camera channel: fov is measured from the client's ProjMat[1][1]
+    // (spyglass zoom and the fov slider just work). Fall back to the pack
+    // value until the first valid payload row arrives.
+    float fov = rot.a > 0.002 ? 5.0 + rot.a * 115.0 : FogParams.z;
     float tanH = tan(radians(fov) * 0.5);
     float aspect = OutSize.x / max(OutSize.y, 1.0);
 
@@ -180,6 +188,20 @@ void main() {
     // 26.3 Globals: CameraBlockPos = floor(camPos), CameraOffset = floor - camPos
     // (see GlobalSettingsUniform.update), so the camera is floor - offset.
     vec3 cam = vec3(CameraBlockPos) - CameraOffset;
+
+    // Clouds are opaque geometry above the highest atlas cell. Without this the
+    // vanilla cloud layer (y=192, far beyond the LOD band) punches holes into
+    // distant mountains, because the LOD pass skips every non-sky pixel.
+    if (!skyPix) {
+        float eyeZ = SkyParams.x / max(depth, 1.0e-9);
+        float vlen = length(vec3(ndc.x * tanH * aspect, ndc.y * tanH, 1.0));
+        vec3 wp = cam + dir * (eyeZ * vlen);
+        skyPix = wp.y > SkyParams.y;
+    }
+    if (!skyPix) {
+        fragColor = scene;
+        return;
+    }
 
     vec2 origin = AtlasInfo.xy;
     float size = AtlasInfo.z;
@@ -210,12 +232,10 @@ void main() {
         dir.y = 1.0e-6;
     }
 
-    // March from just outside the camera. Starting at `near` was a bug: when the
-    // camera looks down, the first sample at `near` is ALREADY below the
-    // heightfield (above < 0), so no sign change was ever detected and the whole
-    // near band "missed". The pass only writes sky pixels, so the near field is
-    // free to start at the camera.
-    float t = max(cell, 1.0);
+    // March from the camera. The pass only overwrites SKY pixels, so the near
+    // field is free; starting at 0 also guarantees the first sample is above
+    // the heightfield (the camera always is), which the crossing test needs.
+    float t = 0.0;
     float dt = max(cell * 0.75, t * 0.004);
     float tHit = -1.0;
     float prevT = t;
@@ -240,7 +260,12 @@ void main() {
         float ground = world_water(xz, origin, size) ? sea : world_height(xz, origin, size);
         above = ground - (cam.y + dir.y * t);
 
-        if (above <= 0.0 && prevDiff > 0.0) {
+        // `above` = ground - rayY: POSITIVE means the ray is below the
+        // heightfield. A hit is the crossing from outside (-) to inside (+).
+        // The old test used (+ -> -), i.e. it only matched rays EXITING the
+        // terrain, which is why only thin far-side "curtains" of hills were
+        // drawn and everything facing the player went missing.
+        if (above >= 0.0 && prevDiff < 0.0) {
             // Bisection between prevT and t.
             float lo = prevT;
             float hi = t;
@@ -248,7 +273,7 @@ void main() {
                 float mid = (lo + hi) * 0.5;
                 vec2 mxz = cam.xz + dir.xz * mid;
                 float g = world_water(mxz, origin, size) ? sea : world_height(mxz, origin, size);
-                if (g - (cam.y + dir.y * mid) <= 0.0) {
+                if (g - (cam.y + dir.y * mid) >= 0.0) {
                     hi = mid;
                 } else {
                     lo = mid;
@@ -291,14 +316,16 @@ void main() {
 
     float tt = fract(GameTime) * 6.28318530718;
     vec3 sunDir = vec3(cos(tt), sin(tt), 0.0);
-    // RAW sun elevation drives the day cycle (shader-pack practice: distant
-    // detail must dissolve into a color that tracks the sky, not a constant).
-    // Post chains get no Fog UBO (verified in 26.3 sources: no vanilla post
-    // shader binds one), so GameTime is the only live sky data available.
-    float sunY = sin(tt);
-    float dayF = smoothstep(-0.14, 0.22, sunY);
-    vec3 veilCol = VeilColor.rgb * mix(0.42, 1.0, dayF);
-    veilCol = mix(veilCol * vec3(0.85, 0.9, 1.12), veilCol, dayF); // moonlit blue at night
+    // Lighting reference comes from the SKY IN THIS FRAME, not from GameTime:
+    // the world clock and the rendered sky can disagree (sunset/daylight
+    // transitions, doDaylightCycle, dimension quirks) and a wrong day factor
+    // made the LOD look lit by moonlight next to sunlit chunks.
+    float skyLum = dot(scene.rgb, vec3(0.299, 0.587, 0.114));
+    float dayF = smoothstep(0.08, 0.45, skyLum);
+    // The fog target is the actual sky behind the pixel, so the far edge of the
+    // LOD band dissolves into the horizon instead of a config colour that can
+    // only ever approximate it. VeilColor only tints it.
+    vec3 veilCol = mix(VeilColor.rgb * mix(0.35, 1.0, dayF), scene.rgb, 0.82);
     if (sunDir.y < -0.12) {
         sunDir = -sunDir;
     }
@@ -312,9 +339,12 @@ void main() {
     vec3 albedo = mix(terrainCol, ColWater.rgb, isWater);
 
     vec3 lightDir = normalize(vec3(sunDir.x, max(sunDir.y, 0.15), 0.0));
-    float diff = max(dot(n, lightDir), 0.0);
-    float ambient = mix(0.20, 0.55, dayF);
-    float sunGain = mix(0.30, 0.80, dayF);
+    // Normalise by the flat-ground response so that sunlit flat terrain lands
+    // exactly on the palette colour -- that is what the real chunks show, and
+    // any mismatch turns the LOD/chunk seam into a visible dark band.
+    float diff = max(dot(n, lightDir), 0.0) / max(lightDir.y, 0.25);
+    float ambient = mix(0.10, 0.62, dayF);
+    float sunGain = mix(0.06, 0.38, dayF);
     vec3 lit = albedo * (ambient + diff * sunGain);
 
     // Distance fog into the day-graded veil color: merges LOD into the sky.

@@ -1,7 +1,6 @@
 {
     "targets": {
-        "clod_scan": { "width": 256, "height": 256 },
-        "clod_scan_small": { "width": 16, "height": 16 },
+        "clod_scan": { "width": 640, "height": 1 },
         "clod_rot_a": { "width": 1, "height": 1, "persistent": true },
         "clod_rot_b": { "width": 1, "height": 1, "persistent": true },
         "clod_swap": {}
@@ -9,57 +8,29 @@
     "passes": [
         {
             "vertex_shader": "minecraft:core/screenquad",
-            "fragment_shader": "clod:post/sun_scan",
+            "fragment_shader": "clod:post/col_scan",
             "inputs": [
+                { "sampler_name": "In", "target": "minecraft:main" }
+            ],
+            "output": "clod_scan"
+        },
+        {
+            "vertex_shader": "minecraft:core/screenquad",
+            "fragment_shader": "clod:post/rot_solve",
+            "inputs": [
+                { "sampler_name": "Scan", "target": "clod_scan" },
                 { "sampler_name": "In", "target": "minecraft:main" },
-                { "sampler_name": "InDepth", "target": "minecraft:main", "use_depth_buffer": true }
-            ],
-            "output": "clod_scan",
-            "uniforms": {
-                "ClodScan": [
-                    { "name": "ScanParams", "type": "vec4", "value": [__FOV__, __SCAN_THRESH__, 0.0, 0.0] }
-                ]
-            }
-        },
-        {
-            "vertex_shader": "minecraft:core/screenquad",
-            "fragment_shader": "clod:post/sun_reduce",
-            "inputs": [
-                { "sampler_name": "Scan", "target": "clod_scan" }
-            ],
-            "output": "clod_scan_small"
-        },
-        {
-            "vertex_shader": "minecraft:core/screenquad",
-            "fragment_shader": "clod:post/sun_solve",
-            "inputs": [
-                { "sampler_name": "Small", "target": "clod_scan_small" },
                 { "sampler_name": "Prev", "target": "clod_rot_a" }
             ],
-            "output": "clod_rot_b",
-            "uniforms": {
-                "ClodSolve": [
-                    { "name": "SolveParams", "type": "vec4", "value": [__FOV__, __ROT_BLEND__, __SOLVE_THRESH__, 0.0] }
-                ]
-            }
+            "output": "clod_rot_b"
         },
         {
             "vertex_shader": "minecraft:core/screenquad",
-            "fragment_shader": "clod:post/pose_solve",
+            "fragment_shader": "clod:post/rot_copy",
             "inputs": [
-                { "sampler_name": "Prev", "target": "clod_rot_b" },
-                { "sampler_name": "InDepth", "target": "minecraft:main", "use_depth_buffer": true },
-                { "sampler_name": "Atlas", "location": "clod:atlas", "width": __ATLAS_CELLS__, "height": __ATLAS_CELLS__, "bilinear": true }
+                { "sampler_name": "In", "target": "clod_rot_b" }
             ],
-            "output": "clod_rot_a",
-            "uniforms": {
-                "ClodPose": [
-                    { "name": "PoseParams", "type": "vec4", "value": [__FOV__, __DEPTH_NEAR__, __MAX_HEIGHT__, __SEA_LEVEL__] }
-                ],
-                "ClodAtlas": [
-                    { "name": "AtlasInfo", "type": "vec4", "value": [__ORIGIN_X__, __ORIGIN_Z__, __ATLAS_SIZE__, __CELL__] }
-                ]
-            }
+            "output": "clod_rot_a"
         },
         {
             "vertex_shader": "minecraft:core/screenquad",
@@ -80,6 +51,9 @@
                 ],
                 "ClodDebug": [
                     { "name": "DebugParams", "type": "vec4", "value": [__DEBUG__, 0.0, 0.0, 0.0] }
+                ],
+                "ClodSky": [
+                    { "name": "SkyParams", "type": "vec4", "value": [__DEPTH_NEAR__, __ATLAS_MAX_H__, 0.0, 0.0] }
                 ],
                 "ClodFog": [
                     { "name": "FogParams", "type": "vec4", "value": [__FOG_START__, __FOG_END__, __FOV__, 0.0] }
